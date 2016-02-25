@@ -1,0 +1,3055 @@
+#include "cd_coap.h"
+#include "cd_coap_common.h"
+#include "udp_coap_process.h"
+#include <stm32f4xx.h>
+#include "pbuf.h"
+#include <includes.h>
+#include "config.h"
+#include "usart.h"
+#include "cd_gpio.h"
+#include "cd_des_app.h"
+#include "lwip/memp.h"
+#include "lwip/ip_addr.h"
+#include "cd_app.h"
+#include "ethernetif.h"
+#include "etharp.h"
+#include <cd_config.h>
+
+#define  BLOK_SIZE              2048
+unsigned char save_card_info[BLOK_SIZE] = {0};
+#define CARD_INFO_COUNT         200                         //²»ÄÜ´óÓÚ254
+#define CARD_INFO_LENTH sizeof(save_card_info)	 		  	//Êý×é³¤¶È	
+#define U32_SIZE CARD_INFO_LENTH /4 + ((CARD_INFO_LENTH % 4) ? 1 : 0)
+
+#define FLASH_SAVE_ADDR  0X08080000 	//ÉèÖÃFLASH ±£´æµØÖ·(±ØÐëÎªÅ¼Êý£¬ÇÒËùÔÚÉÈÇø,Òª´óÓÚ±¾´úÂëËùÕ¼ÓÃµ½µÄÉÈÇø.
+										//·ñÔò,Ð´²Ù×÷µÄÊ±ºò,¿ÉÄÜ»áµ¼ÖÂ²Á³ýÕû¸öÉÈÇø,´Ó¶øÒýÆð²¿·Ö³ÌÐò¶ªÊ§.ÒýÆðËÀ»ú.
+#define CD_PACKET_NUM            50
+#define CD_SAM_SIZE              128
+
+#define LOG_MAX_NUM              320
+#define LOG_DATA_SIZE            40
+#define NUM_UNIT                 8 
+
+#define READ_SAM                 0
+#define SENDTO_SAM               1
+#define READ_NET                 2
+#define SENDTO_NET               3
+#define USART_FROM_SAM           4
+
+#define RUN_STATUS_IDLE          0     //¿ÕÏÐ 
+#define RUN_STATUS_BUSY          5     //ÕýÔÚ½âÂë
+
+//#define PLAT_IP_ADDR0            42
+//#define PLAT_IP_ADDR1            96
+//#define PLAT_IP_ADDR2            169
+//#define PLAT_IP_ADDR3            233
+
+#define PLAT_IP_ADDR0            192
+#define PLAT_IP_ADDR1            168
+#define PLAT_IP_ADDR2            0
+#define PLAT_IP_ADDR3            229
+
+#define PLAT_PORT                5700
+
+//#define PRINT_STEP             //´òÓ¡½âÂëµÄÃ¿Ò»²½µÄºê¿ª¹Ø 
+
+struct netif cd_sam_netif;
+
+cd_app_msg  cd_timeout_msg;
+cd_app_msg  cd_clear_busy_status_msg;
+
+typedef struct 
+{
+	unsigned char cer_start_flag ;  
+	unsigned char cer_flag_ok ;  
+	unsigned char register_flag_ok;
+	unsigned char send_heartbean_flag;
+	unsigned char report_status_flag;
+}cd_flag_t;
+
+cd_flag_t Flag;
+
+typedef struct
+{
+	unsigned char step_id; 
+	unsigned char type;
+	unsigned int time;
+	unsigned char len;
+	unsigned char data[LOG_DATA_SIZE];
+}cd_log_t;
+
+cd_log_t cd_log[LOG_MAX_NUM];
+
+static unsigned char is_new_card_flag = 0;
+unsigned char cache_switch_flag = 0;
+unsigned int send_step_id = 8;
+unsigned int  err_timeout_count = 0;
+unsigned char usart_err_send_retry_flag = 0;
+unsigned char have_done_flag_table[50] = {0};
+unsigned char ethernet_reset_flag = 0;
+unsigned int data_len = 0;
+unsigned char cd_sam_v_buf[CD_SAM_SIZE] = {0};
+unsigned int id_card_buf_len = 0;
+unsigned char id_card_buf[1024 + 512] = {0};
+unsigned char server_ip[15] = {0};  
+unsigned int ip_len = 0;
+unsigned int server_port = 0;
+unsigned int session_id = 0; 
+unsigned int save_session_id = 0; 
+unsigned int old_session_id = 0;
+unsigned int step_id = 0; 
+unsigned int retry_id = 0;
+unsigned int massage_id = 0;
+unsigned char to_id[8] = {0};
+unsigned int to_id_len = 0;
+unsigned char from_id[8] = {0};
+unsigned int from_id_len = 0;
+unsigned char tx_token[4] = {0};
+unsigned int tx_token_len = 0;
+unsigned char id_card_head_buf[CD_SAM_SIZE] = {0};
+unsigned int head_len = 0;
+unsigned int read_type = 0;
+unsigned char client_au_token[256] = {0}; //ÊÖ»ú·¢ËÍÏÂÀ´µÄÊÚÈ¨ÁîÅÆ
+unsigned char plat_au_token[256] = {0};   //Æ½Ì¨·¢ËÍÏÂÀ´µÄÊÚÈ¨ÁîÅÆ
+unsigned int au_token_len = 0;            //ÊÚÈ¨ÁîÅÆ³¤¶È
+unsigned int plat_step_id = 0;
+struct udp_pcb *id_card_upcb;
+struct udp_pcb *client_upcb;
+struct ip_addr *client_addr = NULL;
+unsigned short client_port = 0;
+unsigned client_ip_table[4] = {0};
+unsigned int client_ip = 0;
+unsigned char plat_from_id[2] = {0x01, 0x08};   //hid
+unsigned long long read_card_start_time = 0;
+unsigned long long read_card_end_time = 0;
+unsigned char read_id_card_result_code = 0;
+
+static unsigned char save_from_id[8] = {0};
+static unsigned int tmp_count = 0;
+static unsigned int tmp_count1 = 0;
+static unsigned int tmp_count2 = 0;
+static unsigned int tmp_count3 = 0;
+static unsigned int rx_tmp_id = 0;
+static unsigned int counter = 0;
+unsigned char run_status_busy_flag = 0;
+unsigned char timeout_flag  = 0;
+unsigned char read_id_card_flag = 0;
+unsigned int result_code = 0;
+unsigned char send_id_card_data_ok = 0;
+unsigned char err_flag = 0;
+unsigned char rx_cmd_table[CD_PACKET_NUM][128] = {0}; 
+unsigned char bak_rx_cmd_table[CD_PACKET_NUM][128] = {0}; 
+unsigned char cmd_step_process[CD_PACKET_NUM] = {0};
+unsigned char bak_cmd_step_process[CD_PACKET_NUM] = {0};
+unsigned char send_data_to_sam_flag = 0;
+enum {START = 1, END = 2};
+extern unsigned int cd_rx_sam_start;	
+
+//ÔÆ½âÂë½Ó¿ÚÎÄµµ¶¨ÒåµÄ²¿·Ö±äÁ¿,ÓÐÐ©Ã»ÓÃµ½
+unsigned char Op_type = 0;	              	//²Ù×÷ÀàÐÍ(0:Ìí¼Ó£¬ 1£ºÐÞ¸Ä, 2:É¾³ý£¬3£ºÖØÖÃ)
+unsigned int  Heart_serial = 0;	          	//¿Í»§¶ËÐÄÌøÐòÁÐºÅ
+unsigned char Dev_config_ver[4] = {0x00, 0x00, 0x00, 0x01};   //Éè±¸ÅäÖÃ°æ±¾ºÅ
+unsigned char Dev_program_ver[4] = {0x00, 0x00, 0x00, 0x01};  //Éè±¸³ÌÐò°æ±¾
+unsigned long long Datetime = 0;            //Ê±¼ä´Á 
+unsigned char Hid[8] = {0};                 //Éè±¸µÄhid
+unsigned char Dev_type = 0;  				//Éè±¸ÀàÐÍ
+unsigned char Dev_func = 0;	 				//Éè±¸¹¦ÄÜ±àºÅ
+unsigned char Dev_func_safe	= 0;            //Éè±¸¹¦ÄÜ°²È«¼¶±ð
+unsigned char Online_status	= 0;            //ÔÚÏß×´Ì¬ , 1:ÔÚÏß£¬ 2:ÀëÏß
+unsigned char Dev_name[] = "changda_sam";   //Éè±¸Ãû³Æ
+unsigned char Cer_type	= 0;                //Éè±¸ÈÏÖ¤·½Ê½, 1:¶Ô³ÆÃØÔ¿ÈÏÖ¤, 2:Êý×ÖÖ¤ÊéÈÏÖ¤
+unsigned char Dev_key[8] = {0};             //Éè±¸ÃØÔ¿»òÕßÖ¤Êé	
+unsigned char Dev_sign[8] = {0};	        //Éè±¸Ç©Ãû 
+unsigned char Dev_config[8] = {0};          //Éè±¸µÄÅäÖÃ	
+unsigned char Dev_program[8] = {0};         //Éè±¸³ÌÐò	
+unsigned int  Listen_port = 0;              //·þÎñ¼àÌý¶Ë¿Ú	
+unsigned char Enc_random[8] = {8};	        //¼ÓÃÜºóµÄËæ»úÖµ
+unsigned char Plat_key[8] = {0};            //Æ½Ì¨Ö¤Êé	
+unsigned char Plat_sign[8] = {0};	        //Æ½Ì¨Ç©Ãû
+unsigned int  User_id = 0;                  //ÓÃ»§ID	
+unsigned char User_key[8] = {0};            //ÓÃ»§Ö¤Êé	
+unsigned char User_sign[8] = {0};           //ÓÃ»§Ç©Ãû
+unsigned char Client_sign[8] = {0};         //¿Í»§¶ËÇ©Ãû	
+unsigned char Run_status = 0;               //ÔËÐÐ×´Ì¬(0:Õý³££¬ 1£ºÍ£ÓÃ, 2:¾¯¸æ£¬ 3£º¹ÊÕÏ£¬ 4£º¹Ø±Õ£¬ 5£ºÕ¼ÓÃ)
+unsigned int  Templet_id = 0;               //ÀàÄ£°å±àºÅ
+unsigned char Dev_model[8] = {0};           //Éè±¸ÐÍºÅ
+unsigned char Control_status = 0;           //Éè±¸¿ØÖÆ×´Ì¬
+unsigned char Control_remark[8] = {0};      //Éè±¸¿ØÖÆ×´Ì¬ËµÃ÷
+unsigned char *Wifi_name[20] = {0};         //WiFiÃû³Æ
+unsigned char Wifi_password[20] = {0};      //WiFiÃÜÂë
+unsigned int longitude = 0;                 //¾­¶È(Êµ¼ÊÊýÖµ*1000000)
+unsigned int latitude = 0;                  //Î³¶È(Êµ¼ÊÊýÖµ*1000000)
+unsigned int retry_times = 0;               //¶Á¿¨ÖØÊÔ´ÎÊý
+
+static unsigned char random[8] = {0x55,0x55,0x55,0x55,0x55,0x55,0x55,0x55};
+static unsigned char default_key[] = "12345678";  
+unsigned char Init_key[8] = {0}; 
+
+//1
+unsigned char send_to_sam_cmd_table1[] = 
+{
+	0x50 ,0x00 ,0x00 ,0x00 ,0x00 ,0xd1 ,0x03 ,0x86 ,0x0c ,0x00 ,0x80 ,0x80 ,0x00
+};
+//2
+unsigned char send_to_sam_cmd_table2[] = {0x08, 0x00}; 
+//3
+unsigned char send_to_sam_cmd_table3[] = {0x90, 0x00, 0x00};
+//4
+unsigned char send_to_sam_cmd_table4[] = 
+{
+	0x00 ,0x01 ,0x47 ,0x44 ,0x01 ,0x07 ,0x01 ,0x07 ,0x00 ,0x00 ,0x00 ,0x00 ,0x00 ,0x03 ,0x7a ,0x81 ,0x86 ,0xbf ,0x8d ,0x1b ,0xcd ,0x68 ,0x79 ,0xaa ,0xfb ,0x6e ,0xbc ,0xcb ,0x1c ,0x9f ,0x9a ,0xa4 ,0x90 ,0x00 ,0x00
+};
+
+//26
+unsigned char send_to_sam_cmd_table26[] = {0x90, 0x00, 0x00}; 		
+
+static OS_EVENT *sam_lock = 0;
+
+
+unsigned char cd_sam_create_sem(void)
+{	
+	sam_lock = OSSemCreate(1);
+    
+    if(sam_lock == 0)
+    {
+        printf("sam_lock sem create err!\r\n");
+    	
+		return 0;
+	}
+	
+	return 1;
+}
+
+unsigned char cd_sam_sem_lock(void)
+{	
+    unsigned char lock_ret = 0;
+
+    if(sam_lock)
+    {
+        OSSemPend(sam_lock, 0, &lock_ret);
+        if(lock_ret)
+        {
+            printf("cd_sam_sem_lock err: 01!\r\n");
+        }
+        else
+        {
+            //printf("x");
+        }
+    }
+    else
+    {
+        printf("cd_sam_sem_lock err: 02!\r\n");
+    }
+
+    return lock_ret;
+}
+
+unsigned char cd_sam_sem_unlock(void)
+{	
+    unsigned char lock_ret = 0;
+
+    if(sam_lock)
+    {
+        lock_ret = OSSemPost(sam_lock);
+        if(lock_ret)
+        {
+            printf("cd_sam_sem_unlock err: 01!\r\n");
+        }
+    }
+    else
+    {
+        printf("cd_sam_sem_unlock err: 02!\r\n");
+    }
+
+    return lock_ret;
+}
+
+void time5_init(void)
+{
+    TIM_TimeBaseInitTypeDef  TIM_TimeBaseStructure;
+    NVIC_InitTypeDef NVIC_InitStructure;
+
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM5, ENABLE);
+
+    TIM_DeInit(TIM5);
+
+    TIM_TimeBaseStructure.TIM_Period = 500;     //1ms  
+    TIM_TimeBaseStructure.TIM_Prescaler =168;
+    TIM_TimeBaseStructure.TIM_ClockDivision = 0;
+    TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
+    TIM_TimeBaseInit(TIM5, &TIM_TimeBaseStructure);
+
+    NVIC_InitStructure.NVIC_IRQChannel = TIM5_IRQn;
+    NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 3;
+    NVIC_InitStructure.NVIC_IRQChannelSubPriority = 3;
+    NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&NVIC_InitStructure);
+
+    TIM_ClearFlag(TIM5, TIM_FLAG_Update);
+    TIM_ITConfig(TIM5,TIM_IT_Update, ENABLE);
+
+   // BSP_IntVectSet(BSP_INT_ID_TIM5, BSP_IntHandlerTIM3);
+    
+  //  BSP_IntEn(BSP_INT_ID_TIM3);
+
+    TIM_Cmd(TIM5, ENABLE);	
+}
+
+unsigned int cd_find_index(void)
+{
+	for(int i=0; i<LOG_MAX_NUM; i++)
+	{
+		if(cd_log[i].step_id == 0)
+		{  
+			return i;
+		}
+	}
+	return 0xFFFF;
+}
+
+unsigned char cd_log_set(cd_log_t log)
+{
+	unsigned int index = 0;
+	
+	index = cd_find_index();
+	if(index != 0xFFFF)
+	{
+		cd_log[index].step_id = log.step_id;
+		cd_log[index].type = log.type;
+		cd_log[index].time = log.time;
+		cd_log[index].len = log.len;
+		memcpy(cd_log[index].data, log.data, cd_log[index].len);
+		
+		return 1;
+	}
+	else
+	{
+		return 0;
+	}
+}
+
+unsigned char cd_free_log(cd_log_t log)
+{	
+	log.step_id = 0;
+	log.type = 0xFF;
+	log.time = 0;
+	memset(log.data, 0, log.len);
+	log.len = 0;
+}
+
+unsigned char cd_free_all_log(void)
+{
+	for(int i=0; i<LOG_MAX_NUM; i++)
+	{
+		cd_log[i].step_id = 0;
+		cd_log[i].type = 0xFF;
+		cd_log[i].time = 0;
+		memset(cd_log[i].data, 0, cd_log[i].len);
+		cd_log[i].len = 0;
+	}
+}
+
+void time5_process(void)
+{
+	cd_log_t log_tx_sam;
+	
+	if(tmp_count++ >= 1000)
+	{
+		tmp_count = 0;
+		tmp_count1++;
+		if(tmp_count1 == 60)
+		{
+			tmp_count1 = 0;
+			Flag.send_heartbean_flag = 1;
+			//Flag.report_status_flag = 1;
+			Flag.cer_start_flag = 1;
+		}
+	}
+	
+	if(read_id_card_flag == 1)
+	{
+		tmp_count2++;
+		if(tmp_count2 == 1000*28)
+		{
+			printf("server timeout!\r\n");
+			tmp_count2 = 0;
+			read_id_card_flag = 0;
+			timeout_flag = 1;
+			cd_timeout_msg.id = MSG_TIMEOUT;
+			cd_send_msg(&cd_timeout_msg);
+		}
+	}
+	
+	if(run_status_busy_flag == 1)
+	{
+		tmp_count3++;
+		if(tmp_count3 == 1000 * 30)
+		{
+			memset(save_from_id, 0, 8);
+			tmp_count3 = 0;
+			run_status_busy_flag = 0; 
+			cd_clear_busy_status_msg.id = MSG_CLEAR_BUSY_STATUS;
+			cd_send_msg(&cd_clear_busy_status_msg);
+		}
+	}
+    
+	if(send_data_to_sam_flag == START)
+	{
+		counter++;
+#ifdef CD_BLOK_SIZE_50
+		if(counter >= 50  || (step_id >= 44)) //80ms
+#else            
+        if(counter >= 50  || (step_id >= 36)) //80ms
+#endif            
+		{   
+            if(err_flag == 1)
+                send_step_id = 8;
+			for(int i=7;  i<CD_PACKET_NUM; i++)
+			{   
+                if(cmd_step_process[i] == send_step_id && rx_tmp_id > 7)           //ÕÒµ½¿ÉÒÔ·ÅÊý¾ÝµÄ°ü
+                {	
+                    counter = 0;
+                    send_data_to_sam_flag = END;
+
+                    log_tx_sam.step_id = send_step_id;
+                    log_tx_sam.type = SENDTO_SAM;
+                    log_tx_sam.time = OSTimeGet();
+                    log_tx_sam.len = 0;
+                    memset(log_tx_sam.data, 0, LOG_DATA_SIZE);
+                    cd_log_set(log_tx_sam);
+                    cd_free_log(log_tx_sam);
+                    
+                    //print_hex_dump_bytes(rx_cmd_table[i] + 1, rx_cmd_table[i][0]);
+                    cd_tx_data_to_sam(rx_cmd_table[i] + 1,  rx_cmd_table[i][0]);//·¢ËÍÊÖ»ú¶ËµÄÊý¾Ýµ½½âÂëÆ÷
+                #ifdef PRINT_STEP    
+                    printf("*rx step%d, tx step%d.\r\n", step_id, send_step_id);
+                #endif    
+                    send_step_id++;
+                    i = 7;
+                    break;
+                }
+			}
+		}
+		
+		if(counter == 90)
+			counter = 0;
+	}
+}
+
+unsigned short cd_udp_get_massage_id(coap_pdu_t *pdu)
+{	
+	return pdu->hdr->id;
+}
+
+struct udp_pcb * cd_get_udp_pcb(void)
+{
+	return client_upcb;
+}
+
+unsigned int cd_udp_read_pdu_data(coap_pdu_t *rx_pdu, unsigned char *data, unsigned int len)
+{
+	if(coap_pdu_parse(data, len, rx_pdu) == 0)
+	{
+		printf("coap_pdu_pasre is error\r\n");
+		return 0;
+	}
+	return len;
+}
+
+static unsigned int cd_get_tx_token(coap_pdu_t * rx_pdu, unsigned char * token)
+{
+	memcpy(token, rx_pdu->hdr->token, rx_pdu->hdr->token_length);
+	return rx_pdu->hdr->token_length;
+}
+
+void set_sam_ip_mask_gw(void)
+{
+	struct udp_pcb *upcb;
+	struct ip_addr ipaddr;
+	struct ip_addr netmask;
+	struct ip_addr gw;
+	cd_sam_config_t tmp_sam_config;
+	
+	ethernet_reset_flag = 1;                                //ÓÃÀ´ÈÃ¿´ÃÅ¹·¸´Î»ÓÃ
+	cd_get_sam_config(&tmp_sam_config);                     //»ñµÃÅäÖÃ½á¹¹Ìå
+	
+	//ip
+	printf("set sam ip:%d.%d.%d.%d\r\n", tmp_sam_config.sam_ipaddr[0], tmp_sam_config.sam_ipaddr[1], tmp_sam_config.sam_ipaddr[2], tmp_sam_config.sam_ipaddr[3]);
+	IP4_ADDR(&ipaddr, tmp_sam_config.sam_ipaddr[0], tmp_sam_config.sam_ipaddr[1], tmp_sam_config.sam_ipaddr[2], tmp_sam_config.sam_ipaddr[3]);
+	
+	//mask
+	printf("set sam netmask:%d.%d.%d.%d\r\n", tmp_sam_config.sam_netmask[0], tmp_sam_config.sam_netmask[1], tmp_sam_config.sam_netmask[2], tmp_sam_config.sam_netmask[3]);
+	IP4_ADDR(&netmask, tmp_sam_config.sam_netmask[0], tmp_sam_config.sam_netmask[1], tmp_sam_config.sam_netmask[2], tmp_sam_config.sam_netmask[3]);
+	
+	//gw
+	printf("set sam gw:%d.%d.%d.%d\r\n", tmp_sam_config.sam_gw[0], tmp_sam_config.sam_gw[1], tmp_sam_config.sam_gw[2], tmp_sam_config.sam_gw[3]);
+	IP4_ADDR(&gw, tmp_sam_config.sam_gw[0], tmp_sam_config.sam_gw[1], tmp_sam_config.sam_gw[2], tmp_sam_config.sam_gw[3]);
+
+	/* - netif_add(struct netif *netif, struct ip_addr *ipaddr,
+			struct ip_addr *netmask, struct ip_addr *gw,
+			void *state, err_t (* init)(struct netif *netif),
+			err_t (* input)(struct pbuf *p, struct netif *netif))
+
+	Adds your network interface to the netif_list. Allocate a struct
+	netif and pass a pointer to this structure as the first argument.
+	Give pointers to cleared ip_addr structures when using DHCP,
+	or fill them with sane numbers otherwise. The state pointer may be NULL.
+
+	The init function pointer must point to a initialization function for
+	your ethernet netif interface. The following code illustrates it's use.*/
+	netif_add(&cd_sam_netif, &ipaddr, &netmask, &gw, NULL, &ethernetif_init, &ethernet_input);
+
+	/*  Registers the default network interface.*/
+	netif_set_default(&cd_sam_netif);
+
+	/*  When the netif is fully configured this function must be called.*/
+	netif_set_up(&cd_sam_netif);
+}
+
+unsigned char cd_get_ethernet_reset_flag(void)
+{
+	return ethernet_reset_flag;
+}
+
+void cd_clear_ethernet_reset_flag(void)
+{
+	ethernet_reset_flag = 0;
+}
+
+unsigned char cd_sam_request_au(void)
+{
+	unsigned char ret = 0;
+	err_t err;
+	struct pbuf *pb;	
+	struct udp_pcb *upcb;
+	struct ip_addr ipaddr;
+	
+   // return 0;              ///////////////////////////////////////////////////////////////////
+    
+	printf("sam request au!!\r\n");
+	
+	coap_pdu_t *tx_pdu = cd_pdu_memory_get();
+	if(tx_pdu == NULL)
+    {
+		printf("tx_pdu malloc err!\r\n");
+        if(tx_pdu != NULL)
+            cd_pdu_memory_remove(tx_pdu);
+        return 0; 
+	}
+    
+	tx_pdu->max_size  = COAP_MAX_PDU_SIZE;
+	tx_pdu->hdr->type = COAP_MESSAGE_CON; 
+	tx_pdu->hdr->code = COAP_REQUEST_POST;
+	tx_pdu->hdr->id = cd_coap_get_message_id();  
+	unsigned int token_id = 0;		
+	token_id = cd_coap_get_token_id(1000, 1);
+	coap_add_token(tx_pdu, 4, (unsigned char*)&token_id);
+
+	coap_add_option(tx_pdu, CD_COAP_OPTION_URI_PATH, 1, "1");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_ENC_TYPE, 1, "\x00");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_COMMAND_TYPE, 1, "\x03");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_FROM_ID, sizeof(plat_from_id), plat_from_id); 
+	coap_add_option(tx_pdu, CD_COAP_OPTION_TO_ID , 1, "\x01");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_TO_FUNC , 1, "\x01");
+	
+	//21:Ö÷¿ØÆ÷³õÊ¼ÃØÔ¿¼ÓÃÜ
+	unsigned char enc_data[8] = {0};
+	unsigned char des_len = 0;
+	unsigned long long rand_data = 0;
+
+	srand((unsigned int)OSTimeGet());            //²úÉúËæ»úÊýÖÖ×Ó
+	rand_data = rand();                          //Éú³ÉËæ»úÊý
+	memcpy(random, &rand_data, 8);               //±£´æËæ»úÊý
+    memcpy(enc_data, random, sizeof(random));
+    memcpy(Init_key, default_key, sizeof(Init_key));	
+	des_len = desEncBuf(0, 8, Init_key, enc_data);					        
+	coap_add_payload(tx_pdu, 21, sizeof(enc_data), enc_data);	  
+	
+	upcb = udp_new();                               //ÉêÇëÄÚ´æ
+	if(upcb == NULL)
+	{
+		printf("upcb is null\r\n");
+		if(tx_pdu != NULL)
+				cd_pdu_memory_remove(tx_pdu);
+		return 0;
+	}
+	
+	cd_sam_config_t tmp_sam_config;
+	cd_get_sam_config(&tmp_sam_config);                     //»ñµÃÅäÖÃ½á¹¹Ìå
+	unsigned short tmp_port = 0;
+	tmp_port = tmp_sam_config.port[1];
+	tmp_port |= tmp_sam_config.port[0] << 8;
+	udp_bind(upcb, IP_ADDR_ANY, 5000);                 //°ó¶¨±¾»úµÄ¶Ë¿ÚºÍIP£¨IPÎªÈÎÒâ£©
+	IP4_ADDR(&ipaddr, tmp_sam_config.plat_ipaddr[0], tmp_sam_config.plat_ipaddr[1], tmp_sam_config.plat_ipaddr[2], tmp_sam_config.plat_ipaddr[3]);
+	err = udp_connect(upcb, &ipaddr, tmp_port);
+	
+	if(err == ERR_OK)
+	{
+		pb = pbuf_alloc(PBUF_TRANSPORT, tx_pdu->length, PBUF_POOL);	//allocate pbuf from pool
+		if (pb != NULL)
+		{
+			pbuf_take(pb, (char*)tx_pdu->hdr, tx_pdu->length);		//copy data to pbuf 
+			//printf("tx : len=%d\r\n", tx_pdu->length);
+			//print_hex_dump_bytes(tx_pdu->hdr, tx_pdu->length);
+			
+			//cd_dbg_net_flip(0);
+			
+			udp_send(upcb, pb);								//send udp data 
+			pbuf_free(pb);											//free pbuf 
+			//cd_set_green_Ethernet(LED_OFF);
+			ret = 1;
+		}
+		else
+		{
+			ret = 0;
+			printf("pbuf_alloc err!, len=%d\r\n", tx_pdu->length);
+		}
+	}
+	
+	udp_disconnect(upcb);                             //free the UDP connection, so we can accept new clients 
+	udp_remove(upcb);
+	if(tx_pdu != NULL)
+		cd_pdu_memory_remove(tx_pdu);
+	
+	return ret;
+}
+
+unsigned char cd_send_ack_to_plat(coap_pdu_t *rx_pdu)
+{
+	unsigned char ret = 0;
+	err_t err;
+	struct pbuf *pb;	
+	struct udp_pcb *upcb;
+	struct ip_addr ipaddr;
+	unsigned char token[4] = {0};
+	unsigned int token_len = 0;
+	unsigned int massage_id = 0;
+	coap_pay_t *payload = NULL;
+	coap_opt_t *uri = NULL;
+	static char bak_enc_data[8] = {0};
+	unsigned char enc_data[8] = {0};
+	unsigned char des_len = 0;	
+	unsigned int result_code;
+	
+	coap_pdu_t *tx_pdu = cd_pdu_memory_get();
+	if(tx_pdu == NULL)
+    {
+		printf("tx_pdu malloc err!\r\n");
+        if(tx_pdu != NULL)
+            cd_pdu_memory_remove(tx_pdu);
+        return 0; 
+	}
+    token_len = cd_get_tx_token(rx_pdu, token);
+	massage_id = cd_udp_get_massage_id(rx_pdu);  
+	tx_pdu->max_size  = COAP_MAX_PDU_SIZE;
+	tx_pdu->hdr->type = COAP_MESSAGE_ACK; 
+	tx_pdu->hdr->code = COAP_RESPONSE_CODE(205);
+	tx_pdu->hdr->id = massage_id;  	
+	coap_add_token(tx_pdu, token_len, token);
+    
+	uri = cd_find_option_type(rx_pdu, CD_COAP_OPTION_TO_FUNC);//uri
+	switch(*coap_opt_value(uri))
+	{
+		case 2:
+			coap_add_option(tx_pdu, CD_COAP_OPTION_URI_PATH, 1, "2");
+			coap_add_option(tx_pdu, CD_COAP_OPTION_ENC_TYPE, 1, "\x00");
+			coap_add_option(tx_pdu, CD_COAP_OPTION_COMMAND_TYPE, 1, "\x03");
+			coap_add_option(tx_pdu, CD_COAP_OPTION_FROM_ID, sizeof(plat_from_id), plat_from_id); 
+			coap_add_option(tx_pdu, CD_COAP_OPTION_TO_ID , 1, "\x01");
+			coap_add_option(tx_pdu, CD_COAP_OPTION_TO_FUNC , 1, "\x02");
+		
+			result_code = 1;
+			result_code = u32_little_to_big_endian(result_code);
+			coap_add_payload(tx_pdu, 1, sizeof(result_code), (unsigned char *)&result_code);
+			//21:Ö÷¿ØÆ÷³õÊ¼ÃØÔ¿¼ÓÃÜ
+			payload = cd_find_payload_type(rx_pdu, 21);  //Ö÷¿ØÆ÷³õÊ¼ÃØÔ¿¼ÓÃÜÓ¦´ð
+			if(payload == NULL)
+			{
+				printf("uri 2 payload 21 is NULL.\r\n");
+			}
+			
+			if(desDecBuf(0,coap_pay_length(payload), Init_key, coap_pay_value(payload)) == 0)
+			{
+				printf("step2 auth Rx dec err!\r\n");
+			}	
+			print_hex_dump_bytes(coap_pay_value(payload), coap_pay_length(payload));
+		   			
+			memcpy(enc_data, coap_pay_value(payload), coap_pay_length(payload));	
+			des_len = desEncBuf(0, 8, Init_key, enc_data);	
+			//printf("des_len=%d\r\n", des_len);
+			coap_add_payload(tx_pdu, 21, sizeof(enc_data), enc_data);
+			break;
+			
+		case 3:
+			coap_add_option(tx_pdu, CD_COAP_OPTION_URI_PATH, 1, "3");
+			coap_add_option(tx_pdu, CD_COAP_OPTION_ENC_TYPE, 1, "\x00");
+			coap_add_option(tx_pdu, CD_COAP_OPTION_COMMAND_TYPE, 1, "\x03");
+			coap_add_option(tx_pdu, CD_COAP_OPTION_FROM_ID, sizeof(plat_from_id), plat_from_id); 
+			coap_add_option(tx_pdu, CD_COAP_OPTION_TO_ID , 1, "\x01");
+			coap_add_option(tx_pdu, CD_COAP_OPTION_TO_FUNC , 1, "\x03");
+			
+			result_code = 1;
+			result_code = u32_little_to_big_endian(result_code);
+			coap_add_payload(tx_pdu, 1, sizeof(result_code), (unsigned char *)&result_code);
+			//21:Ö÷¿ØÆ÷³õÊ¼ÃØÔ¿¼ÓÃÜ
+			payload = cd_find_payload_type(rx_pdu, 21);  //Ö÷¿ØÆ÷³õÊ¼ÃØÔ¿¼ÓÃÜÓ¦´ð
+			if(payload == NULL)
+			{
+				printf("uri 3 payload 21 is NULL.\r\n");
+			}
+			
+			if(desDecBuf(0,coap_pay_length(payload), Init_key, coap_pay_value(payload)) == 0)
+			{
+				printf("step2 auth Rx dec err!\r\n");
+			}	
+			print_hex_dump_bytes(coap_pay_value(payload), coap_pay_length(payload));
+		   
+			memcpy(enc_data, coap_pay_value(payload), coap_pay_length(payload));
+            memcpy(bak_enc_data, enc_data, 8);			
+			des_len = desEncBuf(0, 8, enc_data, enc_data);	
+			//printf("des_len=%d\r\n", des_len);
+			coap_add_payload(tx_pdu, 21, sizeof(enc_data), enc_data);
+			break;
+			
+		case 4:
+			coap_add_option(tx_pdu, CD_COAP_OPTION_URI_PATH, 1, "4");
+			coap_add_option(tx_pdu, CD_COAP_OPTION_ENC_TYPE, 1, "\x00");
+			coap_add_option(tx_pdu, CD_COAP_OPTION_COMMAND_TYPE, 1, "\x03");
+			coap_add_option(tx_pdu, CD_COAP_OPTION_FROM_ID, sizeof(plat_from_id), plat_from_id); 
+			coap_add_option(tx_pdu, CD_COAP_OPTION_TO_ID , 1, "\x01");
+			coap_add_option(tx_pdu, CD_COAP_OPTION_TO_FUNC , 1, "\x04");
+			
+			result_code = 1;
+			result_code = u32_little_to_big_endian(result_code);
+			coap_add_payload(tx_pdu, 1, sizeof(result_code), (unsigned char *)&result_code);
+			//21:Ö÷¿ØÆ÷³õÊ¼ÃØÔ¿¼ÓÃÜ
+			payload = cd_find_payload_type(rx_pdu, 21);  //Ö÷¿ØÆ÷³õÊ¼ÃØÔ¿¼ÓÃÜÓ¦´ð
+			if(payload == NULL)
+			{
+				printf("uri 4 payload 21 is NULL.\r\n");
+			}
+			
+			if(desDecBuf(0,coap_pay_length(payload), bak_enc_data, coap_pay_value(payload)) == 0)
+			{
+				printf("step2 auth Rx dec err!\r\n");
+			}	
+			memset(bak_enc_data, 0, 8);
+			print_hex_dump_bytes(coap_pay_value(payload), coap_pay_length(payload));
+		   
+			memcpy(enc_data, coap_pay_value(payload), coap_pay_length(payload));	
+			des_len = desEncBuf(0, 8, enc_data, enc_data);	
+			//printf("des_len=%d\r\n", des_len);
+			coap_add_payload(tx_pdu, 21, sizeof(enc_data), enc_data);
+			break;
+			
+		case 80:
+			coap_add_option(tx_pdu, CD_COAP_OPTION_URI_PATH, 2, "80");
+			coap_add_option(tx_pdu, CD_COAP_OPTION_ENC_TYPE, 1, "\x01");
+			coap_add_option(tx_pdu, CD_COAP_OPTION_COMMAND_TYPE, 1, "\x00");
+			coap_add_option(tx_pdu, CD_COAP_OPTION_FROM_ID, sizeof(plat_from_id), plat_from_id); 
+			coap_add_option(tx_pdu, CD_COAP_OPTION_TO_ID , 1, "\x01");
+			coap_add_option(tx_pdu, CD_COAP_OPTION_TO_FUNC , 1, "\x50");
+			
+			result_code = 1;
+			result_code = u32_little_to_big_endian(result_code);
+			coap_add_payload(tx_pdu, 1, sizeof(result_code), (unsigned char *)&result_code);
+			break;
+		
+		default :
+			printf("no this uri!\r\n");
+			break;
+	} 	  
+	
+	upcb = udp_new();                               //ÉêÇëÄÚ´æ
+	if(upcb == NULL)
+	{
+		printf("upcb is null\r\n");
+		if(tx_pdu != NULL)
+				cd_pdu_memory_remove(tx_pdu);
+		return 0;
+	}
+	
+	cd_sam_config_t tmp_sam_config;
+	cd_get_sam_config(&tmp_sam_config);                     //»ñµÃÅäÖÃ½á¹¹Ìå
+	unsigned short tmp_port = 0;
+	tmp_port = tmp_sam_config.port[1];
+	tmp_port |= tmp_sam_config.port[0] << 8;
+	udp_bind(upcb, IP_ADDR_ANY, 5000);                 //°ó¶¨±¾»úµÄ¶Ë¿ÚºÍIP£¨IPÎªÈÎÒâ£©
+	IP4_ADDR(&ipaddr, tmp_sam_config.plat_ipaddr[0], tmp_sam_config.plat_ipaddr[1], tmp_sam_config.plat_ipaddr[2], tmp_sam_config.plat_ipaddr[3]);
+	err = udp_connect(upcb, &ipaddr, tmp_port);
+	if(err == ERR_OK)
+	{
+		pb = pbuf_alloc(PBUF_TRANSPORT, tx_pdu->length, PBUF_POOL);	//allocate pbuf from pool
+		if (pb != NULL)
+		{
+			pbuf_take(pb, (char*)tx_pdu->hdr, tx_pdu->length);		//copy data to pbuf 
+			//printf("tx : len=%d\r\n", tx_pdu->length);
+			//print_hex_dump_bytes(tx_pdu->hdr, tx_pdu->length);
+			
+			//cd_dbg_net_flip(0);
+			
+			udp_send(upcb, pb);								//send udp data 
+			pbuf_free(pb);											//free pbuf 
+			//cd_set_green_Ethernet(LED_OFF);
+			ret = 1;
+		}
+		else
+		{
+			ret = 0;
+			printf("pbuf_alloc err!, len=%d\r\n", tx_pdu->length);
+		}
+	}
+	
+	udp_disconnect(upcb);                             //free the UDP connection, so we can accept new clients 
+	udp_remove(upcb);
+	if(tx_pdu != NULL)
+		cd_pdu_memory_remove(tx_pdu);
+	
+	return ret;
+}
+
+unsigned char cd_sam_register(void)
+{
+	unsigned char ret = 0;
+	err_t err;
+	struct pbuf *pb;	
+	struct udp_pcb *upcb;
+	struct ip_addr ipaddr;
+	
+	coap_pdu_t *tx_pdu = cd_pdu_memory_get();
+	if(tx_pdu == NULL)
+    {
+		printf("tx_pdu malloc err!\r\n");
+        if(tx_pdu != NULL)
+            cd_pdu_memory_remove(tx_pdu);
+        return 0;         
+    }
+	tx_pdu->max_size  = COAP_MAX_PDU_SIZE;
+	tx_pdu->hdr->type = COAP_MESSAGE_CON; 
+	tx_pdu->hdr->code = COAP_REQUEST_POST;
+	tx_pdu->hdr->id = cd_coap_get_message_id();  
+	unsigned int token_id = 0;		
+	token_id = cd_coap_get_token_id(1000, 10);
+	coap_add_token(tx_pdu, 4, (unsigned char*)&token_id);
+	
+	coap_add_option(tx_pdu, CD_COAP_OPTION_URI_PATH, 2, "10");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_ENC_TYPE, 1, "\x00");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_COMMAND_TYPE, 1, "\x02");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_FROM_ID, sizeof(plat_from_id), plat_from_id); 
+	coap_add_option(tx_pdu, CD_COAP_OPTION_TO_ID , 1, "\x01");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_TO_FUNC , 1, "\x0A");
+
+	Dev_type = 1;
+	coap_add_payload(tx_pdu, 8, sizeof(Dev_type), &Dev_type);	 //8: Éè±¸ÀàÐÍ  
+	coap_add_payload(tx_pdu, 13, sizeof(Dev_name), Dev_name);   //13: Éè±¸Ãû³Æ
+	Cer_type = 1;
+	coap_add_payload(tx_pdu, 14, sizeof(Cer_type), &Cer_type);   //14: Éè±¸ÈÏÖ¤·½Ê½, 1:¶Ô³ÆÃØÔ¿ÈÏÖ¤, 2:Êý×ÖÖ¤ÊéÈÏÖ¤
+	unsigned int tmp_Templet_id = 0;
+	Templet_id = 34;
+	tmp_Templet_id = u32_little_to_big_endian(Templet_id);
+	coap_add_payload(tx_pdu, 29, sizeof(tmp_Templet_id), (unsigned char*)&tmp_Templet_id);   //29: Éè±¸ÀàÐÍÄ£°å±àºÅ
+
+	upcb = udp_new();                               //ÉêÇëÄÚ´æ
+	if(upcb == NULL)
+	{
+		printf("upcb is null\r\n");
+		if(tx_pdu != NULL)
+				cd_pdu_memory_remove(tx_pdu);
+		return 0;
+	}
+	
+	cd_sam_config_t tmp_sam_config;
+	cd_get_sam_config(&tmp_sam_config);                     //»ñµÃÅäÖÃ½á¹¹Ìå
+	unsigned short tmp_port = 0;
+	tmp_port = tmp_sam_config.port[1];
+	tmp_port |= tmp_sam_config.port[0] << 8;
+	udp_bind(upcb, IP_ADDR_ANY, 5000);                  //°ó¶¨±¾»úµÄ¶Ë¿ÚºÍIP£¨IPÎªÈÎÒâ£©
+	IP4_ADDR(&ipaddr, tmp_sam_config.plat_ipaddr[0], tmp_sam_config.plat_ipaddr[1], tmp_sam_config.plat_ipaddr[2], tmp_sam_config.plat_ipaddr[3]);
+	err = udp_connect(upcb, &ipaddr, tmp_port);
+	if(err == ERR_OK)
+	{
+		pb = pbuf_alloc(PBUF_TRANSPORT, tx_pdu->length, PBUF_POOL);	//allocate pbuf from pool
+		if (pb != NULL)
+		{
+			pbuf_take(pb, (char*)tx_pdu->hdr, tx_pdu->length);		//copy data to pbuf 
+			//printf("tx : len=%d\r\n", tx_pdu->length);
+			//print_hex_dump_bytes(tx_pdu->hdr, tx_pdu->length);
+			
+			//cd_dbg_net_flip(0);
+			
+			udp_send(upcb, pb);								//send udp data 
+			pbuf_free(pb);											//free pbuf 
+			//cd_set_green_Ethernet(LED_OFF);
+			ret = 1;
+		}
+		else
+		{
+			ret = 0;
+			printf("pbuf_alloc err!, len=%d\r\n", tx_pdu->length);
+		}
+	}
+	
+	udp_disconnect(upcb);                             //free the UDP connection, so we can accept new clients 
+	udp_remove(upcb);
+	if(tx_pdu != NULL)
+		cd_pdu_memory_remove(tx_pdu);
+	
+	return ret;
+}
+
+unsigned char cd_sam_report_heartbean(void)
+{
+	unsigned char ret = 0;
+	err_t err;
+	struct pbuf *pb;	
+	struct udp_pcb *upcb;
+	struct ip_addr ipaddr;
+	cd_sam_config_t tmp_sam_config;
+	
+	coap_pdu_t *tx_pdu = cd_pdu_memory_get();
+	if(tx_pdu == NULL)
+    {
+		printf("tx_pdu malloc err!\r\n");
+        if(tx_pdu != NULL)
+            cd_pdu_memory_remove(tx_pdu);
+        return 0; 
+    }
+	tx_pdu->max_size  = COAP_MAX_PDU_SIZE;
+	tx_pdu->hdr->type = COAP_MESSAGE_CON; 
+	tx_pdu->hdr->code = COAP_REQUEST_POST;
+	tx_pdu->hdr->id = cd_coap_get_message_id();  
+	unsigned int token_id = 0;		
+	token_id = cd_coap_get_token_id(1000, 12);
+	coap_add_token(tx_pdu, 4, (unsigned char*)&token_id);
+
+	coap_add_option(tx_pdu, CD_COAP_OPTION_URI_PATH, 2, "12");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_ENC_TYPE, 1, "\x01");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_COMMAND_TYPE, 1, "\x02");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_FROM_ID, sizeof(plat_from_id), plat_from_id); 
+	coap_add_option(tx_pdu, CD_COAP_OPTION_TO_ID , 1, "\x01");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_TO_FUNC , 1, "\x0C");
+
+    unsigned int tmp_Heart_serial = 0;
+	Heart_serial++;
+	tmp_Heart_serial = u32_little_to_big_endian(Heart_serial);
+	coap_add_payload(tx_pdu, 3, sizeof(tmp_Heart_serial), (unsigned char*)&tmp_Heart_serial); //3:¿Í»§¶ËÐÄÌøÐòÁÐºÅ
+	coap_add_payload(tx_pdu, 4, sizeof(Dev_program_ver), Dev_program_ver);                    //4:Éè±¸³ÌÐò°æ±¾
+	coap_add_payload(tx_pdu, 5, sizeof(Dev_config_ver), Dev_config_ver);                      //5:Éè±¸ÅäÖÃ°æ±¾ºÅ
+	unsigned int tmp_longitude = 0;                
+	unsigned int tmp_latitude = 0; 
+	
+	cd_get_sam_config(&tmp_sam_config);             //»ñµÃÅäÖÃ½á¹¹Ìå
+	//¾­¶È
+	longitude = tmp_sam_config.au_longitude[3];
+	longitude |= tmp_sam_config.au_longitude[2] << 8;
+	longitude |= tmp_sam_config.au_longitude[1] << 16;
+	longitude |= tmp_sam_config.au_longitude[0] << 24;
+	//Î³¶È
+	latitude = tmp_sam_config.au_latitude[3];
+	latitude |= tmp_sam_config.au_latitude[2] << 8;
+	latitude |= tmp_sam_config.au_latitude[1] << 16;
+	latitude |= tmp_sam_config.au_latitude[0] << 24;
+	
+	tmp_longitude = u32_little_to_big_endian(longitude * 1000000);     //¾­¶È(Êµ¼ÊÊýÖµ*1000000)
+	tmp_latitude = u32_little_to_big_endian(latitude * 1000000);       //Î³¶È(Êµ¼ÊÊýÖµ*1000000)
+	coap_add_payload(tx_pdu, 41, sizeof(tmp_longitude), (unsigned char*)&tmp_longitude);                 
+	coap_add_payload(tx_pdu, 42, sizeof(tmp_latitude), (unsigned char*)&tmp_latitude); 
+
+	unsigned char date_time[8] = {0};
+	Datetime = OSTimeGet();
+	date_time[7] = Datetime;
+	date_time[6] = Datetime >> 8;
+	date_time[5] = Datetime >> 16;
+	date_time[4] = Datetime >> 24;
+	date_time[3] = Datetime >> 32;
+	date_time[2] = Datetime >> 40;
+	date_time[1] = Datetime >> 48;
+	date_time[0] = Datetime >> 56;
+	coap_add_payload(tx_pdu, 6, sizeof(date_time), date_time);                                  //6:Ê±¼ä´Á 
+
+	upcb = udp_new();                               //ÉêÇëÄÚ´æ
+	if(upcb == NULL)
+	{
+		printf("upcb is null\r\n");
+		if(tx_pdu != NULL)
+				cd_pdu_memory_remove(tx_pdu);
+		return 0;
+	}
+	
+	cd_get_sam_config(&tmp_sam_config);                     //»ñµÃÅäÖÃ½á¹¹Ìå
+	unsigned short tmp_port = 0;
+	tmp_port = tmp_sam_config.port[1];
+	tmp_port |= tmp_sam_config.port[0] << 8;
+	udp_bind(upcb, IP_ADDR_ANY, 5000);                  //°ó¶¨±¾»úµÄ¶Ë¿ÚºÍIP£¨IPÎªÈÎÒâ£©
+	IP4_ADDR(&ipaddr, tmp_sam_config.plat_ipaddr[0], tmp_sam_config.plat_ipaddr[1], tmp_sam_config.plat_ipaddr[2], tmp_sam_config.plat_ipaddr[3]);
+	err = udp_connect(upcb, &ipaddr, tmp_port);
+	if(err == ERR_OK)
+	{
+		pb = pbuf_alloc(PBUF_TRANSPORT, tx_pdu->length, PBUF_POOL);	//allocate pbuf from pool
+		if (pb != NULL)
+		{
+			pbuf_take(pb, (char*)tx_pdu->hdr, tx_pdu->length);		//copy data to pbuf 
+			//printf("tx : len=%d\r\n", tx_pdu->length);
+			//print_hex_dump_bytes(tx_pdu->hdr, tx_pdu->length);
+			
+			//cd_dbg_net_flip(0);
+			
+			udp_send(upcb, pb);								//send udp data 
+			pbuf_free(pb);											//free pbuf 
+			//cd_set_green_Ethernet(LED_OFF);
+			ret = 1;
+		}
+		else
+		{
+			ret = 0;
+			printf("pbuf_alloc err!, len=%d\r\n", tx_pdu->length);
+		}
+	}
+	
+	udp_disconnect(upcb);                             //free the UDP connection, so we can accept new clients 
+	udp_remove(upcb);
+	if(tx_pdu != NULL)
+		cd_pdu_memory_remove(tx_pdu);
+	
+	return ret;
+}
+
+
+unsigned char cd_sam_report_status(void)
+{
+	unsigned char ret = 0;
+	err_t err;
+	struct pbuf *pb;	
+	struct udp_pcb *upcb;
+	struct ip_addr ipaddr;
+	
+	coap_pdu_t *tx_pdu = cd_pdu_memory_get();
+	if(tx_pdu == NULL)
+    {
+		printf("tx_pdu malloc err!\r\n");
+        if(tx_pdu != NULL)
+            cd_pdu_memory_remove(tx_pdu);
+        return 0;         
+    }
+	tx_pdu->max_size  = COAP_MAX_PDU_SIZE;
+	tx_pdu->hdr->type = COAP_MESSAGE_CON; 
+	tx_pdu->hdr->code = COAP_REQUEST_POST;
+	tx_pdu->hdr->id = cd_coap_get_message_id();  
+	unsigned int token_id = 0;		
+	token_id = cd_coap_get_token_id(1000, 14);
+	coap_add_token(tx_pdu, 4, (unsigned char*)&token_id);
+	
+	coap_add_option(tx_pdu, CD_COAP_OPTION_URI_PATH, 2, "14");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_ENC_TYPE, 1, "\x01");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_COMMAND_TYPE, 1, "\x00");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_FROM_ID, sizeof(plat_from_id), plat_from_id); 
+	coap_add_option(tx_pdu, CD_COAP_OPTION_TO_ID , 1, "\x01");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_TO_FUNC , 1, "\x0E");
+	
+	coap_add_payload(tx_pdu, 28, sizeof(Run_status), &Run_status);  	//28£ºÉè±¸ÔËÐÐ×´Ì¬
+	
+	upcb = udp_new();                               //ÉêÇëÄÚ´æ
+	if(upcb == NULL)
+	{
+		printf("upcb is null\r\n");
+		if(tx_pdu != NULL)
+				cd_pdu_memory_remove(tx_pdu);
+		return 0;
+	}
+	
+	cd_sam_config_t tmp_sam_config;
+	cd_get_sam_config(&tmp_sam_config);                     //»ñµÃÅäÖÃ½á¹¹Ìå
+	unsigned short tmp_port = 0;
+	tmp_port = tmp_sam_config.port[1];
+	tmp_port |= tmp_sam_config.port[0] << 8;
+	udp_bind(upcb, IP_ADDR_ANY, 5000);                  //°ó¶¨±¾»úµÄ¶Ë¿ÚºÍIP£¨IPÎªÈÎÒâ£©
+	IP4_ADDR(&ipaddr, tmp_sam_config.plat_ipaddr[0], tmp_sam_config.plat_ipaddr[1], tmp_sam_config.plat_ipaddr[2], tmp_sam_config.plat_ipaddr[3]);
+	err = udp_connect(upcb, &ipaddr, tmp_port);
+	if(err == ERR_OK)
+	{
+		pb = pbuf_alloc(PBUF_TRANSPORT, tx_pdu->length, PBUF_POOL);	//allocate pbuf from pool
+		if (pb != NULL)
+		{
+			pbuf_take(pb, (char*)tx_pdu->hdr, tx_pdu->length);		//copy data to pbuf 
+			//printf("tx : len=%d\r\n", tx_pdu->length);
+			//print_hex_dump_bytes(tx_pdu->hdr, tx_pdu->length);
+			
+			//cd_dbg_net_flip(0);
+			
+			udp_send(upcb, pb);								//send udp data 
+			pbuf_free(pb);											//free pbuf 
+			//cd_set_green_Ethernet(LED_OFF);
+			ret = 1;
+		}
+		else
+		{
+			ret = 0;
+			printf("pbuf_alloc err!, len=%d\r\n", tx_pdu->length);
+		}
+	}
+	
+	udp_disconnect(upcb);                             //free the UDP connection, so we can accept new clients 
+	udp_remove(upcb);
+	if(tx_pdu != NULL)
+		cd_pdu_memory_remove(tx_pdu);
+	
+	return ret;
+}
+
+unsigned char cd_add_usart_from_sam_data_to_log(void)
+{
+	unsigned char usart_from_sam_buf[50] = {0};
+	unsigned char sam_buf_len = 0;
+	cd_log_t log_usart_from_sam;
+	
+	cd_usart_get_sam_v_data(usart_from_sam_buf, sizeof(usart_from_sam_buf));             				
+	sam_buf_len = cd_usart_get_sam_v_data_len();     
+	//printf("usart_from_sam_buf: len = %d\r\n", sam_buf_len);
+	//print_hex_dump_bytes(usart_from_sam_buf, sam_buf_len);
+	log_usart_from_sam.step_id = cd_get_usart_from_sam_ret();
+	log_usart_from_sam.type = USART_FROM_SAM;
+	log_usart_from_sam.time = OSTimeGet();
+	log_usart_from_sam.len = sam_buf_len;
+	memcpy(log_usart_from_sam.data, usart_from_sam_buf, log_usart_from_sam.len);
+	cd_log_set(log_usart_from_sam);
+	cd_free_log(log_usart_from_sam);
+	
+	return 1;
+}
+
+unsigned char cd_send_log_to_plat(unsigned int result)
+{
+	unsigned char ret = 0;
+	err_t err;
+	struct ip_addr ipaddr;
+	struct pbuf *pb;	
+	struct udp_pcb *upcb;
+	unsigned char tmp_buf[1024 + 256] = {0};
+	unsigned int offset = 0;
+	unsigned int log_num = 0;
+	unsigned char count = 0;
+	unsigned char unit = 0;
+	
+	for(int i=0; i<LOG_MAX_NUM; i++)
+	{
+		if(cd_log[i].step_id != 0)
+			log_num++;
+		else
+			break;
+	}
+	
+    unit = LOG_MAX_NUM/NUM_UNIT;
+	count = log_num / unit + ((log_num % unit) > 0 ? 1 : 0);
+	
+	for(int j=0; j<count; j++)
+	{
+		for(int i=0; i<unit; i++)
+		{   
+			if(offset < sizeof(tmp_buf))
+			{		
+				if(cd_log[i + j * unit].step_id == 0)
+					break;
+				*(tmp_buf + offset + 0) = cd_log[i + j * unit].step_id;
+				*(tmp_buf + offset + 1) = cd_log[i + j * unit].type;
+				unsigned int tmp_time = 0;
+				tmp_time = u32_little_to_big_endian(cd_log[i + j * unit].time);
+				memcpy(tmp_buf + offset + 2, &tmp_time, 4);
+				*(tmp_buf +offset + 6) = cd_log[i + j * unit].len;
+				if(cd_log[i + j * unit].len != 0)
+				{
+					memcpy(tmp_buf + offset + 7, cd_log[i + j * unit].data, cd_log[i + j * unit].len);
+				}
+				offset += (7 + cd_log[i + j * unit].len);
+                //printf("offset = %d\r\n", offset);
+			}
+			else 
+			{   
+                printf("offset = %d\r\n", offset);
+				printf("tmp_buf is overflow!\r\n");
+				offset = 0;
+				break;
+			}
+		}
+		coap_pdu_t *tx_pdu = cd_pdu_memory_get();
+		if(tx_pdu == NULL)
+        {
+			printf("tx_pdu malloc err!\r\n");
+            if(tx_pdu != NULL)
+                cd_pdu_memory_remove(tx_pdu);
+            return 0;   
+		}
+        tx_pdu->max_size  = COAP_MAX_PDU_SIZE;
+		tx_pdu->hdr->type = COAP_MESSAGE_CON; 
+		tx_pdu->hdr->code = COAP_REQUEST_POST;
+		tx_pdu->hdr->id = cd_coap_get_message_id();  
+        unsigned int token_id = 0;		
+		token_id = cd_coap_get_token_id(1000, 21);
+		coap_add_token(tx_pdu, 4, (unsigned char*)&token_id);
+		
+		coap_add_option(tx_pdu, CD_COAP_OPTION_URI_PATH, 2, "21");
+		coap_add_option(tx_pdu, CD_COAP_OPTION_ENC_TYPE, 1, "\x01");
+		coap_add_option(tx_pdu, CD_COAP_OPTION_COMMAND_TYPE, 1, "\x00");
+		coap_add_option(tx_pdu, CD_COAP_OPTION_FROM_ID, sizeof(plat_from_id), plat_from_id); 
+		coap_add_option(tx_pdu, CD_COAP_OPTION_TO_ID , 1, "\x01");
+		coap_add_option(tx_pdu, CD_COAP_OPTION_TO_FUNC , 1, "\x15");
+		
+		//1:
+		unsigned int  tmp_result = 0;
+		tmp_result = u32_little_to_big_endian(result);
+		coap_add_payload(tx_pdu, 1, sizeof(tmp_result), (unsigned char*)&tmp_result);		
+		//105:ÁîÅÆ
+		coap_add_payload(tx_pdu, 105, sizeof(plat_au_token), plat_au_token);
+		//115£º
+		//printf("tmp_buf: len = %d\r\n", offset);
+		//print_hex_dump_bytes(tmp_buf, offset);
+		coap_add_payload(tx_pdu, 115, offset , tmp_buf); 
+		offset = 0;
+		memset(tmp_buf, 0, sizeof(tmp_buf));
+		
+		upcb = udp_new();                               //ÉêÇëÄÚ´æ
+		if(upcb == NULL)
+		{
+			cd_free_all_log();
+			printf("upcb is null\r\n");
+			if(tx_pdu != NULL)
+					cd_pdu_memory_remove(tx_pdu);
+			return 0;
+		}
+		
+		cd_sam_config_t tmp_sam_config;
+		cd_get_sam_config(&tmp_sam_config);                     //»ñµÃÅäÖÃ½á¹¹Ìå
+		unsigned short tmp_port = 0;
+		tmp_port = tmp_sam_config.port[1];
+		tmp_port |= tmp_sam_config.port[0] << 8;
+		udp_bind(upcb, IP_ADDR_ANY, 5000);                  //°ó¶¨±¾»úµÄ¶Ë¿ÚºÍIP£¨IPÎªÈÎÒâ£©
+		IP4_ADDR(&ipaddr, tmp_sam_config.plat_ipaddr[0], tmp_sam_config.plat_ipaddr[1], tmp_sam_config.plat_ipaddr[2], tmp_sam_config.plat_ipaddr[3]);
+		err = udp_connect(upcb, &ipaddr, tmp_port);
+		if(err == ERR_OK)
+		{
+			pb = pbuf_alloc(PBUF_TRANSPORT, tx_pdu->length, PBUF_POOL);	//allocate pbuf from pool
+			if (pb != NULL)
+			{
+				pbuf_take(pb, (char*)tx_pdu->hdr, tx_pdu->length);		//copy data to pbuf 
+				//printf("tx : len=%d\r\n", tx_pdu->length);
+				//print_hex_dump_bytes(tx_pdu->hdr, tx_pdu->length);
+				
+				//cd_dbg_net_flip(0);
+                
+                if(tmp_sam_config.log_switch == 1)
+                    udp_send(upcb, pb);								//send udp data 
+                else
+                    printf("log switch is close!\r\n");
+				pbuf_free(pb);											//free pbuf 
+				//cd_set_green_Ethernet(LED_OFF);
+				ret = 1;
+			}
+			else
+			{
+				ret = 0;
+				printf("pbuf_alloc err!, len=%d\r\n", tx_pdu->length);
+			}
+		}
+		
+		udp_disconnect(upcb);                             //free the UDP connection, so we can accept new clients 
+		udp_remove(upcb);
+		if(tx_pdu != NULL)
+			cd_pdu_memory_remove(tx_pdu);
+	}
+	cd_free_all_log();
+	printf("send log to plat!\r\n");
+    
+	return ret;
+}
+
+unsigned char cd_send_id_card_data_to_plat(unsigned char *data, unsigned int data_len, unsigned int result, unsigned int retry_times)
+{
+	unsigned char ret = 0;
+	err_t err;
+	struct ip_addr ipaddr;
+	struct pbuf *pb;	
+	struct udp_pcb *upcb;
+	
+	printf("send id card data to plat!\r\n");
+	
+	read_card_end_time = OSTimeGet();          //¶Á¿¨½áÊøÊ±¼ä
+	
+	coap_pdu_t *tx_pdu = cd_pdu_memory_get();
+	if(tx_pdu == NULL)
+    {
+		printf("tx_pdu malloc err!\r\n");
+        if(tx_pdu != NULL)
+            cd_pdu_memory_remove(tx_pdu);
+        return 0;
+	}
+	tx_pdu->max_size  = COAP_MAX_PDU_SIZE;
+	tx_pdu->hdr->type = COAP_MESSAGE_CON; 
+	tx_pdu->hdr->code = COAP_REQUEST_POST;
+	tx_pdu->hdr->id = cd_coap_get_message_id();  
+	unsigned int token_id = 0;		
+	token_id = cd_coap_get_token_id(1000, 13);
+	coap_add_token(tx_pdu, 4, (unsigned char*)&token_id);
+	
+	coap_add_option(tx_pdu, CD_COAP_OPTION_URI_PATH, 2, "13");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_ENC_TYPE, 1, "\x01");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_COMMAND_TYPE, 1, "\x00");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_FROM_ID, sizeof(plat_from_id), plat_from_id); 
+	coap_add_option(tx_pdu, CD_COAP_OPTION_TO_ID , 1, "\x01");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_TO_FUNC , 1, "\x0D");
+	
+	//1:
+	unsigned int  tmp_result = 0;
+	tmp_result = u32_little_to_big_endian(result);
+	coap_add_payload(tx_pdu, 1, sizeof(tmp_result), (unsigned char*)&tmp_result);		
+	//103:ÖØÊÔ´ÎÊý
+	unsigned int  tmp_retry_times = 0;
+	tmp_retry_times = u32_little_to_big_endian(retry_times);
+	retry_times = 0;
+	coap_add_payload(tx_pdu, 103, sizeof(tmp_retry_times), (unsigned char*)&tmp_retry_times);	
+	//105:ÁîÅÆ
+	//printf("au_token_len = %d\r\n", au_token_len);
+	//print_hex_dump_bytes(plat_au_token, au_token_len);
+	coap_add_payload(tx_pdu, 105, au_token_len, plat_au_token);
+	//106:Éí·ÝÖ¤ÐÅÏ¢
+	coap_add_payload(tx_pdu, 106, data_len , data);
+	//117£º¶Á¿¨ÓÃÊ±£º
+	unsigned int  tmp_read_card_use_time = 0;
+	unsigned int use_time = read_card_end_time - read_card_start_time;
+	tmp_read_card_use_time = u32_little_to_big_endian(use_time);
+	coap_add_payload(tx_pdu, 117, sizeof(tmp_read_card_use_time) , (unsigned char*)&tmp_read_card_use_time);
+	
+	upcb = udp_new();                               //ÉêÇëÄÚ´æ
+	if(upcb == NULL)
+	{
+		printf("upcb is null\r\n");
+		if(tx_pdu != NULL)
+				cd_pdu_memory_remove(tx_pdu);
+		return 0;
+	}
+	
+	cd_sam_config_t tmp_sam_config;
+	 cd_get_sam_config(&tmp_sam_config);                     //»ñµÃÅäÖÃ½á¹¹Ìå
+	unsigned short tmp_port = 0;
+	tmp_port = tmp_sam_config.port[1];
+	tmp_port |= tmp_sam_config.port[0] << 8;
+	udp_bind(upcb, IP_ADDR_ANY, 5000);                 //°ó¶¨±¾»úµÄ¶Ë¿ÚºÍIP£¨IPÎªÈÎÒâ£©
+	IP4_ADDR(&ipaddr, tmp_sam_config.plat_ipaddr[0], tmp_sam_config.plat_ipaddr[1], tmp_sam_config.plat_ipaddr[2], tmp_sam_config.plat_ipaddr[3]);
+	err = udp_connect(upcb, &ipaddr, tmp_port);
+	if(err == ERR_OK)
+	{
+		pb = pbuf_alloc(PBUF_TRANSPORT, tx_pdu->length, PBUF_POOL);	//allocate pbuf from pool
+		if (pb != NULL)
+		{
+			pbuf_take(pb, (char*)tx_pdu->hdr, tx_pdu->length);		//copy data to pbuf 
+			//printf("tx : len=%d\r\n", tx_pdu->length);
+			//print_hex_dump_bytes(tx_pdu->hdr, tx_pdu->length);
+			
+			//cd_dbg_net_flip(0);
+			
+			udp_send(upcb, pb);								//send udp data 
+			pbuf_free(pb);											//free pbuf 
+			//cd_set_green_Ethernet(LED_OFF);
+			ret = 1;
+		}
+		else
+		{
+			ret = 0;
+			printf("pbuf_alloc err!, len=%d\r\n", tx_pdu->length);
+		}
+	}
+	
+	udp_disconnect(upcb);                             //free the UDP connection, so we can accept new clients 
+	udp_remove(upcb);
+	if(tx_pdu != NULL)
+		cd_pdu_memory_remove(tx_pdu);
+	
+	return ret;
+}
+
+unsigned char cd_usart_rx_cmd_err(void)
+{
+	cd_log_t log_tx_net;
+	unsigned int tmp_id = 0;
+	unsigned char ret = 0;
+	err_t err;
+	struct ip_addr ipaddr;
+	struct pbuf *pb;	
+	struct udp_pcb *upcb;
+	
+	//cd_sam_sem_lock();
+	printf("usart rx cmd err!\r\n");
+	
+	retry_times++;
+    err_timeout_count = 0;
+    usart_err_send_retry_flag = 1;
+	err_flag = 1;
+    send_step_id = 8;
+	tmp_id = rx_tmp_id;
+	rx_tmp_id = 0;
+	counter = 0;
+	send_data_to_sam_flag = END;
+    
+	cd_sam_rx_init();	
+	OSTimeDlyHMSM(0, 0, 0, 50);            
+    
+	if(timeout_flag == 1)                  //³¬Ê±
+	{
+		retry_times = 0;
+		read_id_card_flag = 0;                   //¶ÁÈ¡Í£Ö¹
+		tmp_count2 = 0; 
+		timeout_flag = 0;                  //¶ÁÈ¡³¬Ê±                         //¼ÆÊ±ÇåÁã
+		tmp_count3 = 0;
+		run_status_busy_flag = 0; 
+		Run_status = RUN_STATUS_IDLE;            //´¦ÓÚ¿ÕÏÐ£¬ ¿ÉÒÔ½øÐÐÏÂ´Î½âÂë
+		cd_sam_report_status(); 
+		result_code = 0;
+		cd_send_id_card_data_to_plat(id_card_buf, id_card_buf_len, result_code, retry_times);
+		cd_send_log_to_plat(result_code);
+		cd_free_all_log();
+		memset(save_from_id, 0, 8); 
+        memset(have_done_flag_table, 0, sizeof(have_done_flag_table));   
+        err_timeout_count = 0;
+        usart_err_send_retry_flag = 0; 
+        is_new_card_flag = 0;        
+		cd_set_green_Ethernet(LED_OFF);
+        for(int i=0; i<CD_PACKET_NUM; i++)
+        {
+            cmd_step_process[i] = 0;            //·¢ËÍÍê³É
+            memset(rx_cmd_table[i], 0,  rx_cmd_table[i][0] + 1);   //Çå¿ÕÊý¾Ý
+        }
+		printf("timeout!!!!!!!!!\r\n");
+		//cd_sam_sem_unlock();
+		return 0;
+	}
+	
+	coap_pdu_t *tx_pdu = cd_pdu_memory_get();
+	if(tx_pdu == NULL)
+    {
+		printf("tx_pdu malloc err!\r\n");
+        if(tx_pdu != NULL)
+            cd_pdu_memory_remove(tx_pdu);
+        return 0;
+    }
+	tx_pdu->max_size  = COAP_MAX_PDU_SIZE;
+	tx_pdu->hdr->type = COAP_MESSAGE_NON; //ÎÞÓ¦´ð
+	tx_pdu->hdr->code = COAP_REQUEST_POST;
+	//tx_pdu->hdr->id = massage_id;  	
+	//coap_add_token(tx_pdu, tx_token_len, tx_token);  
+	tx_pdu->hdr->id = cd_coap_get_message_id();  
+	unsigned int token_id = 0;		
+	token_id = cd_coap_get_token_id(1000, 106);
+	coap_add_token(tx_pdu, 4, (unsigned char*)&token_id);
+	
+	coap_add_option(tx_pdu, CD_COAP_OPTION_URI_PATH, 3, "106");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_FROM_ID, from_id_len, from_id);
+	coap_add_option(tx_pdu, CD_COAP_OPTION_TO_ID , to_id_len, to_id);
+	coap_add_option(tx_pdu, CD_COAP_OPTION_TO_FUNC , 1, "\x6A");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_LOCAL_IP , ip_len, server_ip);/////////
+	coap_add_option(tx_pdu, CD_COAP_OPTION_LOCAL_PORT , 4, (unsigned char*)&server_port);/////////
+   
+	unsigned int tmp_session_id = 0;
+	tmp_session_id = u32_little_to_big_endian(session_id);
+	coap_add_payload(tx_pdu, 101, sizeof(tmp_session_id), (unsigned char*)&tmp_session_id);
+	
+	upcb = udp_new();                               //ÉêÇëÄÚ´æ
+	if(upcb == NULL)
+	{
+		printf("upcb is null\r\n");
+		if(tx_pdu != NULL)
+				cd_pdu_memory_remove(tx_pdu);
+		//cd_sam_sem_unlock();
+		return 0;
+	}
+	
+	cd_sam_config_t tmp_sam_config;
+	cd_get_sam_config(&tmp_sam_config);                     //»ñµÃÅäÖÃ½á¹¹Ìå
+	unsigned short tmp_port = 0;
+	tmp_port = tmp_sam_config.port[1];
+	tmp_port |= tmp_sam_config.port[0] << 8;
+	udp_bind(upcb, IP_ADDR_ANY, 5000);                  //°ó¶¨±¾»úµÄ¶Ë¿ÚºÍIP£¨IPÎªÈÎÒâ£©
+//    printf("remote ip:%d.%d.%d.%d, port=%d\r\n", client_ip_table[0], client_ip_table[1], client_ip_table[2], client_ip_table[3], client_port);
+	IP4_ADDR(&ipaddr, client_ip_table[0], client_ip_table[1], client_ip_table[2], client_ip_table[3]);
+	err = udp_connect(upcb, &ipaddr, client_port);
+	if(err == ERR_OK)
+	{
+		pb = pbuf_alloc(PBUF_TRANSPORT, tx_pdu->length, PBUF_POOL);	//allocate pbuf from pool
+		if (pb != NULL)
+		{
+			pbuf_take(pb, (char*)tx_pdu->hdr, tx_pdu->length);		//copy data to pbuf 
+			//printf("uart err tx : len=%d\r\n", tx_pdu->length);
+			//print_hex_dump_bytes(tx_pdu->hdr, tx_pdu->length);
+        #ifndef PRINT_STEP
+			printf("rx_step_id=%d\r\n", tmp_id);                    //´íÎóÊÇ¶ÔÓ¦µÚ¼¸²½
+        #endif    
+			//cd_dbg_net_flip(0);
+			
+			log_tx_net.step_id = tmp_id;
+			log_tx_net.type = SENDTO_NET;
+			log_tx_net.time = OSTimeGet();
+			log_tx_net.len = 0;
+			memset(log_tx_net.data, 0, LOG_DATA_SIZE);
+			cd_log_set(log_tx_net);
+			cd_free_log(log_tx_net);
+			
+			udp_send(upcb, pb);								//send udp data 
+			pbuf_free(pb);											//free pbuf 
+			//cd_set_green_Ethernet(LED_OFF);
+			ret = 1;
+		}
+		else
+		{
+			ret = 0;
+			printf("pbuf_alloc err!, len=%d\r\n", tx_pdu->length);
+		}
+	}
+	
+	udp_disconnect(upcb);                             //free the UDP connection, so we can accept new clients 
+	udp_remove(upcb);
+	if(tx_pdu != NULL)
+		cd_pdu_memory_remove(tx_pdu);
+    //cd_sam_sem_unlock();
+	return ret;
+}
+
+unsigned char cd_write_id_card_data_to_flash(unsigned char *card_data, unsigned int len,  unsigned int flash_addr)
+{
+    unsigned int tmp_len = len /4 + ((len % 4) ? 1 : 0);
+    
+    STMFLASH_Write(flash_addr,(u32*)card_data, tmp_len);
+    
+    return 1;
+}
+
+unsigned char cd_read_id_card_from_flash(unsigned char *read_data, unsigned int len, unsigned int flash_addr)
+{   
+    unsigned int tmp_len = len /4 + ((len % 4) ? 1 : 0);
+    
+    STMFLASH_Read(flash_addr,(u32*)read_data, tmp_len);
+    
+    return 1;
+}
+        
+unsigned char cd_find_empty_flash(void)
+{
+    unsigned char tmp = 0;
+    
+    for(int i=0; i<CARD_INFO_COUNT; i++)
+    {
+        cd_read_id_card_from_flash(&tmp, 1, FLASH_SAVE_ADDR + i * BLOK_SIZE);
+        if(tmp != 0x01)         //Ã¿¸öFLASH¿éµÄµÚÒ»¸ö×Ö½ÚÊÇ·ñÒÑ¾­±»Ð´
+        {
+            return i;
+        }
+    }
+    
+    return 0xFF;
+}
+    
+unsigned char cd_query_flash_card_info(unsigned char *head_buf, unsigned int len)
+{
+    unsigned char tmp_buf[50] = {0};
+    
+    if(len > sizeof(tmp_buf))
+        return 0xFF;
+    
+    for(int i=0; i<CARD_INFO_COUNT; i++)
+    {
+        cd_read_id_card_from_flash(tmp_buf, 1+len, FLASH_SAVE_ADDR + i * BLOK_SIZE); //¶ÁÇ°36×Ö½ÚµÄÊý¾Ý
+        if(memcmp(tmp_buf + 1, head_buf, len) == 0)         //Ã¿¸öFLASH¿éµÄµÚÒ»¸ö×Ö½ÚÊÇ·ñÒÑ¾­±»Ð´
+        {
+            return i;
+        }
+    }
+    return 0xFF;
+}
+
+unsigned char cd_rx_id_card_data_msg(unsigned char result_code)
+{
+	cd_log_t log_tx_net;
+	unsigned char ret = 0;
+	err_t err;
+	struct ip_addr ipaddr;
+	struct pbuf *pb;	
+	struct udp_pcb *upcb;
+	
+	log_tx_net.step_id = rx_tmp_id;
+	log_tx_net.type = SENDTO_NET;
+	log_tx_net.time = OSTimeGet();
+	log_tx_net.len = 0;
+	memset(log_tx_net.data, 0, LOG_DATA_SIZE);
+	cd_log_set(log_tx_net);
+	cd_free_log(log_tx_net);
+	
+    send_step_id = 8;
+	rx_tmp_id = 0;
+    is_new_card_flag = 0;
+	send_data_to_sam_flag = END;
+	counter = 0;
+	for(int i=0; i<CD_PACKET_NUM; i++)
+	{
+		cmd_step_process[i] = 0;            //·¢ËÍÍê³É
+		memset(rx_cmd_table[i], 0,  rx_cmd_table[i][0] + 1);   //Çå¿ÕÊý¾Ý
+	}
+    
+	coap_pdu_t *tx_pdu = cd_pdu_memory_get();
+	if(tx_pdu == NULL)
+    {
+		printf("tx_pdu malloc err!\r\n");
+        if(tx_pdu != NULL)
+            cd_pdu_memory_remove(tx_pdu);
+        return 0;
+    }
+	tx_pdu->max_size  = COAP_MAX_PDU_SIZE;
+	tx_pdu->hdr->type = COAP_MESSAGE_NON; //ÎÞÓ¦´ð
+	tx_pdu->hdr->code = COAP_REQUEST_POST;
+	tx_pdu->hdr->id = cd_coap_get_message_id();  
+	unsigned int token_id = 0;		
+	token_id = cd_coap_get_token_id(1000, 105);
+	coap_add_token(tx_pdu, 4, (unsigned char*)&token_id);
+	
+	coap_add_option(tx_pdu, CD_COAP_OPTION_URI_PATH, 3, "105");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_FROM_ID, from_id_len, from_id);
+	coap_add_option(tx_pdu, CD_COAP_OPTION_TO_ID , to_id_len, to_id);
+	coap_add_option(tx_pdu, CD_COAP_OPTION_TO_FUNC , 1, "\x69");
+	coap_add_option(tx_pdu, CD_COAP_OPTION_LOCAL_IP , ip_len, server_ip);
+	coap_add_option(tx_pdu, CD_COAP_OPTION_LOCAL_PORT , 4, (unsigned char *)&server_port);
+
+	unsigned int tmp_result_code = 0;
+	tmp_result_code = u32_little_to_big_endian(result_code);
+	coap_add_payload(tx_pdu, 1, sizeof(tmp_result_code), (unsigned char*)&tmp_result_code);
+
+	if(result_code != 2)                                  //²»µÈÓÚtoken´íÎó²Å·¢ËÍÉí·ÝÖ¤Êý¾Ý
+	{
+		unsigned int tmp_session_id = 0;
+		tmp_session_id = u32_little_to_big_endian(session_id);
+		coap_add_payload(tx_pdu, 101, sizeof(tmp_session_id), (unsigned char*)&tmp_session_id);
+		
+		//»ñÈ¡Éí·ÝÖ¤ÐÅÏ¢
+		while(cd_get_sam_v_read_fixed_info_state() != OK) 
+		{
+			OSTimeDlyHMSM(0, 0, 0, 1);
+		}
+		cd_usart_get_sam_v_data(id_card_buf, 1024 + 512);
+		id_card_buf_len = cd_usart_get_sam_v_data_len();
+		coap_add_payload(tx_pdu, 106, id_card_buf_len , id_card_buf);
+		//printf("id card data: len=%d\r\n", id_card_buf_len);
+		//print_hex_dump_bytes(id_card_buf, id_card_buf_len);
+	}
+	else
+	{
+		printf("token err, notify client!\r\n");
+	}
+	
+    for(int i=0; i<3; i++)
+    {
+        upcb = udp_new();                               //ÉêÇëÄÚ´æ
+        if(upcb == NULL)
+        {
+            printf("upcb is null\r\n");
+            if(tx_pdu != NULL)
+                    cd_pdu_memory_remove(tx_pdu);
+            return 0;
+        }
+        
+        cd_sam_config_t tmp_sam_config;
+        cd_get_sam_config(&tmp_sam_config);                     //»ñµÃÅäÖÃ½á¹¹Ìå
+        unsigned short tmp_port = 0;
+        tmp_port = tmp_sam_config.port[1];
+        tmp_port |= tmp_sam_config.port[0] << 8;
+        udp_bind(upcb, IP_ADDR_ANY, 5000);                  //°ó¶¨±¾»úµÄ¶Ë¿ÚºÍIP£¨IPÎªÈÎÒâ?
+    //	printf("remote ip:%d.%d.%d.%d\r\n", client_ip_table[0], client_ip_table[1], client_ip_table[2], client_ip_table[3]);
+        IP4_ADDR(&ipaddr, client_ip_table[0], client_ip_table[1], client_ip_table[2], client_ip_table[3]);
+        err = udp_connect(upcb, &ipaddr, client_port);
+        if(err == ERR_OK)
+        {
+            pb = pbuf_alloc(PBUF_TRANSPORT, tx_pdu->length, PBUF_POOL);	//allocate pbuf from pool
+            if (pb != NULL)
+            {
+                pbuf_take(pb, (char*)tx_pdu->hdr, tx_pdu->length);		//copy data to pbuf 
+                //printf("tx client: len=%d\r\n", tx_pdu->length);
+                //print_hex_dump_bytes(tx_pdu->hdr, tx_pdu->length);
+                
+                cd_dbg_net_flip(0);
+
+                udp_send(upcb, pb);								//send udp data 
+                pbuf_free(pb);											//free pbuf 
+                cd_set_green_Ethernet(LED_OFF);
+                ret = 1;
+            }
+            else
+            {
+                ret = 0;
+                printf("pbuf_alloc err!, len=%d\r\n", tx_pdu->length);
+            }
+        }
+        
+        udp_disconnect(upcb);                             //free the UDP connection, so we can accept new clients 
+        udp_remove(upcb);
+        
+        //printf("send card data times=%d\r\n", i+1);
+    }
+    
+    if(tx_pdu != NULL)
+        cd_pdu_memory_remove(tx_pdu);
+
+	
+    if(result_code != 2)                             //¶Á¿¨³É¹¦²ÅÖ´ÐÐ
+	{
+		result_code = 1;                         //³É¹¦
+		cd_send_id_card_data_to_plat(id_card_buf, id_card_buf_len, result_code, retry_times);
+		cd_send_log_to_plat(result_code);
+		cd_free_all_log();
+        
+        unsigned char index = 0;
+        save_card_info[0] = 0x01;
+        memcpy(save_card_info + 1, id_card_head_buf, head_len);
+        memcpy(save_card_info + 1 + head_len, id_card_buf, id_card_buf_len);
+        index = cd_find_empty_flash();
+        cd_write_id_card_data_to_flash(save_card_info, (1 + head_len + id_card_buf_len), (FLASH_SAVE_ADDR + index*BLOK_SIZE));
+		memset(save_card_info, 0, sizeof(save_card_info));
+        memset(id_card_buf, 0, id_card_buf_len);
+		id_card_buf_len = 0;
+		
+		timeout_flag = 0;
+		tmp_count2 = 0;                       						  //Çå¶ÁÈ¡Ê±¼ä¼ÆÊý
+		run_status_busy_flag = 0; 
+		tmp_count3 = 0;
+		read_id_card_flag = 0;               						  //¶ÁÈ¡½áÊø
+		Run_status = RUN_STATUS_IDLE;                                 //´¦ÓÚ¿ÕÏÐ£¬ ¿ÉÒÔ½øÐÐÏÂ´Î½âÂë
+		cd_sam_report_status(); 
+		memset(save_from_id, 0, 8);                                   
+		memset(have_done_flag_table, 0, sizeof(have_done_flag_table));
+        printf("send id card data to client!\r\n");
+	}
+	
+	return ret;
+}
+
+//½ÓÊÕµ½½âÂëÆ÷µÄÃ¿Ò»²½µÄÊý¾Ý£¬»Ø¸´Ç°4²½¸ø½âÂëÆ÷£¬5~7·¢ËÍ¸ø¿Í»§¶Ë£¨ÈçÊÖ»ú£©£¬5~7²½ÎªÈÏÖ¤µÄ¹ý³Ì
+unsigned char cd_udp_send_coap_data(void)
+{
+	unsigned char ret = 0;
+	err_t err;
+	struct ip_addr ipaddr;
+	struct pbuf *pb;	
+	unsigned int data_len = 0;
+	struct udp_pcb *upcb;
+	unsigned int count_id = 0;
+	static int log_num = 0;
+	cd_log_t log_rx_sam;
+	cd_log_t log_tx_sam;
+	cd_log_t log_tx_net;
+	
+    if(err_flag == 1)                     //Èç¹ûÄ¿Ç°ÊÕµ½´íÎóµÄÏûÏ¢£¬²»ÔÙ¼ÌÐø½âÂë£¬µÈµ½ÏÂ´Î½âÂë
+        return 0;
+    
+	if(rx_tmp_id >=7)
+	{
+		send_data_to_sam_flag = START;  
+	}
+	rx_tmp_id++; 
+	
+	cd_rd_data_from_sam(cd_sam_v_buf, CD_SAM_SIZE);             				
+	data_len = cd_get_sam_data_len();
+    //printf("rx_tmp_id = %d, data_len = %d\r\n", rx_tmp_id, data_len);	
+	//print_hex_dump_bytes(cd_sam_v_buf, data_len);
+	log_rx_sam.step_id = rx_tmp_id;
+	log_rx_sam.type = READ_SAM;
+	log_rx_sam.time = OSTimeGet();
+	if(rx_tmp_id < 8)                                //Ö»±£´æÇ°7²½µÄ½âÂëÆ÷µÄÊý¾Ý
+	{
+		log_rx_sam.len = data_len;
+		memcpy(log_rx_sam.data, cd_sam_v_buf, log_rx_sam.len);
+	}
+    else
+    {
+         log_rx_sam.len = 0;
+         memset(log_rx_sam.data, 0, LOG_DATA_SIZE);
+    }
+	cd_log_set(log_rx_sam);
+	cd_free_log(log_rx_sam);
+	
+//	cd_dbg_led_flip();
+	
+	 if(rx_tmp_id < 5)                                 //Ç°4²½²»ÓÃ¸ú¿Í»§¶Ë½»»¥Êý¾Ý£¬Ö±½Ó°ÑÏÂÒ»²½µÄÊý¾Ý»Ø¸´¸ø½âÂëÆ÷
+	 {
+     #ifdef PRINT_STEP    
+        printf("*rx step%d, tx step%d.\r\n", rx_tmp_id, rx_tmp_id);
+     #endif  
+		switch(rx_tmp_id)
+		{
+			case 1:
+				send_data_to_sam_flag = END;
+				counter = 0;
+				cd_tx_data_to_sam(send_to_sam_cmd_table1, sizeof(send_to_sam_cmd_table1));//·¢ËÍÊÖ»ú¶ËµÄÊý¾Ýµ½½âÂëÆ÷
+				OSTimeDlyHMSM(0, 0, 0, 5);           //È¥µôÕâ¸öÑÓÊ±½âÂëÊ§°Ü£¬¾ßÌåÔ­Òò²»ÊÇÊ®·ÖÃ÷È·
+				cd_sam_v_choose_id_card();
+				
+				log_tx_sam.step_id = rx_tmp_id;
+				log_tx_sam.type = SENDTO_SAM;
+				log_tx_sam.time = OSTimeGet();
+				log_tx_sam.len = sizeof(send_to_sam_cmd_table1);
+				memcpy(log_tx_sam.data, send_to_sam_cmd_table1, log_tx_sam.len );
+				cd_log_set(log_tx_sam);
+				cd_free_log(log_tx_sam);
+				break;
+				
+			case 2:
+				send_data_to_sam_flag = END;
+				counter = 0;
+				cd_tx_data_to_sam(send_to_sam_cmd_table2, sizeof(send_to_sam_cmd_table2));//·¢ËÍÊÖ»ú¶ËµÄÊý¾Ýµ½½âÂëÆ÷
+				OSTimeDlyHMSM(0, 0, 0, 3);         //È¥µôÕâ¸öÑÓÊ±½âÂëÊ§°Ü£¬¾ßÌåÔ­Òò²»ÊÇÊ®·ÖÃ÷È·
+				cd_sam_v_read_id_card_info();
+				
+				log_tx_sam.step_id = rx_tmp_id;
+				log_tx_sam.type = SENDTO_SAM;
+				log_tx_sam.time = OSTimeGet();
+				log_tx_sam.len = sizeof(send_to_sam_cmd_table2);
+				memcpy(log_tx_sam.data, send_to_sam_cmd_table2, log_tx_sam.len );
+				cd_log_set(log_tx_sam);
+				cd_free_log(log_tx_sam);
+				break;
+				
+			case 3:
+				send_data_to_sam_flag = END;
+				counter = 0;
+				cd_tx_data_to_sam(send_to_sam_cmd_table3, sizeof(send_to_sam_cmd_table3));//·¢ËÍÊÖ»ú¶ËµÄÊý¾Ýµ½½âÂëÆ÷
+			
+				log_tx_sam.step_id = rx_tmp_id;
+				log_tx_sam.type = SENDTO_SAM;
+				log_tx_sam.time = OSTimeGet();
+				log_tx_sam.len = sizeof(send_to_sam_cmd_table3);
+				memcpy(log_tx_sam.data, send_to_sam_cmd_table3, log_tx_sam.len );
+				cd_log_set(log_tx_sam);
+				cd_free_log(log_tx_sam);
+				break;	
+			
+			case 4:
+				send_data_to_sam_flag = END;
+				counter = 0;
+				cd_tx_data_to_sam(id_card_head_buf, head_len);							  //·¢ËÍÊÖ»ú¶ËµÄÊý¾Ýµ½½âÂëÆ÷
+                OSTimeDlyHMSM(0, 0, 0, 3);
+                log_tx_sam.step_id = rx_tmp_id;
+				log_tx_sam.type = SENDTO_SAM;
+				log_tx_sam.time = OSTimeGet();
+				log_tx_sam.len = head_len;
+				memcpy(log_tx_sam.data, id_card_head_buf, head_len);
+				cd_log_set(log_tx_sam);
+				cd_free_log(log_tx_sam);
+				break;	
+			
+			default:
+				break;
+		}
+	} 
+	
+	if(rx_tmp_id == 5 || rx_tmp_id == 6 || rx_tmp_id == 7 )
+	{	
+		coap_pdu_t *tx_pdu = cd_pdu_memory_get();
+		if(tx_pdu == NULL)
+        {
+			printf("tx_pdu malloc err!\r\n");
+            if(tx_pdu != NULL)
+                cd_pdu_memory_remove(tx_pdu);
+            return 0;
+        }
+		tx_pdu->max_size  = COAP_MAX_PDU_SIZE;
+		tx_pdu->hdr->type = COAP_MESSAGE_NON; //ÎÞÓ¦´ð
+		tx_pdu->hdr->code = COAP_REQUEST_POST;
+		//tx_pdu->hdr->id = massage_id; 
+		//coap_add_token(tx_pdu, tx_token_len, tx_token); 	
+		tx_pdu->hdr->id = cd_coap_get_message_id();  
+		unsigned int token_id = 0;		
+		token_id = cd_coap_get_token_id(1000, 105);
+		coap_add_token(tx_pdu, 4, (unsigned char*)&token_id);
+		
+		coap_add_option(tx_pdu, CD_COAP_OPTION_URI_PATH, 3, "103");
+		coap_add_option(tx_pdu, CD_COAP_OPTION_FROM_ID, from_id_len, from_id);
+		coap_add_option(tx_pdu, CD_COAP_OPTION_TO_ID , to_id_len, to_id);
+		coap_add_option(tx_pdu, CD_COAP_OPTION_TO_FUNC , 1, "\x67");    //103
+		coap_add_option(tx_pdu, CD_COAP_OPTION_LOCAL_IP , ip_len, server_ip);
+		coap_add_option(tx_pdu, CD_COAP_OPTION_LOCAL_PORT , 4, (unsigned char*)&server_port);
+		
+		count_id = rx_tmp_id;
+		//count_id++;
+		unsigned int tmp_session_id = 0;
+		tmp_session_id = u32_little_to_big_endian(session_id);
+		count_id = u32_little_to_big_endian(count_id);   
+		retry_id = u32_little_to_big_endian(retry_id);
+		 
+		coap_add_payload(tx_pdu, 101, sizeof(tmp_session_id), (unsigned char*)&tmp_session_id);
+		coap_add_payload(tx_pdu, 102, sizeof(count_id) , (unsigned char*)&count_id);
+		coap_add_payload(tx_pdu, 103, sizeof(retry_id) , (unsigned char*)&retry_id);
+
+		cd_rd_data_from_sam(cd_sam_v_buf, CD_SAM_SIZE);             				 //get data from sam device
+		data_len = cd_get_sam_data_len();                          					 //get len from sam device
+		coap_add_payload(tx_pdu, 104, data_len , cd_sam_v_buf);
+		memset(cd_sam_v_buf, 0, data_len);                          //clear the cd_sam_v_buf where have been write
+	
+		upcb = udp_new();                               //ÉêÇëÄÚ´æ
+		if(upcb == NULL)
+		{
+			printf("upcb is null\r\n");
+			if(tx_pdu != NULL)
+				cd_pdu_memory_remove(tx_pdu);
+			return 0;
+		}
+		
+		cd_sam_config_t tmp_sam_config;
+		 cd_get_sam_config(&tmp_sam_config);                     //»ñµÃÅäÖÃ½á¹¹Ìå
+		unsigned short tmp_port = 0;
+		tmp_port = tmp_sam_config.port[1];
+		tmp_port |= tmp_sam_config.port[0] << 8;
+		udp_bind(upcb, IP_ADDR_ANY, 5000);                  //°ó¶¨±¾»úµÄ¶Ë¿ÚºÍIP£¨IPÎªÈÎÒâ?
+//		printf("remote ip:%d.%d.%d.%d\r\n", client_ip_table[0], client_ip_table[1], client_ip_table[2], client_ip_table[3]);
+		IP4_ADDR(&ipaddr, client_ip_table[0], client_ip_table[1], client_ip_table[2], client_ip_table[3]);
+		err = udp_connect(upcb, &ipaddr, client_port);
+		if(err == ERR_OK)
+		{
+			pb = pbuf_alloc(PBUF_TRANSPORT, tx_pdu->length, PBUF_POOL);	//allocate pbuf from pool
+			if (pb != NULL)
+			{
+				pbuf_take(pb, (char*)tx_pdu->hdr, tx_pdu->length);		//copy data to pbuf 
+				//printf("tx client: len=%d\r\n", tx_pdu->length);
+				//print_hex_dump_bytes(tx_pdu->hdr, tx_pdu->length);
+				//printf("rx_tmp_id=%d\r\n", rx_tmp_id);
+				cd_rd_data_from_sam(cd_sam_v_buf, CD_SAM_SIZE);             				
+				data_len = cd_get_sam_data_len();     
+				log_tx_net.step_id = rx_tmp_id;
+				log_tx_net.type = SENDTO_NET;
+				log_tx_net.time = OSTimeGet();
+				log_tx_net.len = data_len;
+				memcpy(log_tx_net.data, cd_sam_v_buf, log_tx_net.len);
+				cd_log_set(log_tx_net);
+				cd_free_log(log_tx_net);
+				
+				//cd_dbg_net_flip(0);
+				
+				udp_send(upcb, pb);								//send udp data 
+				pbuf_free(pb);											//free pbuf 
+				cd_set_green_Ethernet(LED_OFF);
+				ret = 1;
+			}
+			else
+			{
+				ret = 0;
+				printf("pbuf_alloc err!, len=%d\r\n", tx_pdu->length);
+			}
+		}
+		
+		udp_disconnect(upcb);                             //free the UDP connection, so we can accept new clients 
+		udp_remove(upcb);
+		if(tx_pdu != NULL)
+			cd_pdu_memory_remove(tx_pdu);
+	}
+	
+	return ret;
+}
+
+//get to_id
+unsigned char cd_udp_get_to_id(unsigned char *to_id, coap_pdu_t *rx_pdu)
+{
+    unsigned char *to_id_by_option = NULL;
+	unsigned char to_id_len = 0;
+	
+	to_id_by_option = cd_find_option_type(rx_pdu, CD_COAP_OPTION_FROM_ID);		//´Ë´¦µÄÍ¨¹ý°Ñ¶Ô·½µÄFROM_ID×÷Îª×Ô¼ºµÄTO_ID
+	memcpy(to_id, coap_opt_value(to_id_by_option), coap_opt_length(to_id_by_option));	//»ñÈ¡TO_ID
+	to_id_len = coap_opt_length(to_id_by_option);											//TO_ID³¤¶È
+	
+	return to_id_len;
+}
+
+//get from_id
+unsigned char cd_udp_get_from_id(unsigned char *from_id, coap_pdu_t *rx_pdu)
+{
+    unsigned char *from_id_by_option = NULL;
+	unsigned char  from_id_len = 0;
+	
+	from_id_by_option = cd_find_option_type(rx_pdu, CD_COAP_OPTION_TO_ID);//´Ë´¦µÄÍ¨¹ý°Ñ¶Ô·½µÄTO_ID×÷Îª×Ô¼ºµÄFROM_ID
+	memcpy(from_id, coap_opt_value(from_id_by_option), coap_opt_length(from_id_by_option));
+	from_id_len = coap_opt_length(from_id_by_option);											
+	
+	return from_id_len;
+}
+
+unsigned int cd_udp_get_server_ip(unsigned char *server_ip, coap_pdu_t *rx_pdu)
+{
+	unsigned char *server_ip_by_option = NULL;
+	unsigned char ip_len =  0;
+	
+	server_ip_by_option = cd_find_option_type(rx_pdu, CD_COAP_OPTION_LOCAL_IP); //ip
+	memcpy(server_ip, coap_opt_value(server_ip_by_option), coap_opt_length(server_ip_by_option));	
+	ip_len = coap_opt_length(server_ip_by_option);											
+	
+	return ip_len;
+}
+
+unsigned int cd_udp_get_server_port(coap_pdu_t *rx_pdu)
+{
+	unsigned char *server_port_by_option = NULL;
+	unsigned char port[4] = {0};
+	unsigned int server_port = 0;
+	unsigned int ret_ip = 0;
+	
+	server_port_by_option = cd_find_option_type(rx_pdu, CD_COAP_OPTION_LOCAL_PORT); //port
+	memcpy(port, coap_opt_value(server_port_by_option), coap_opt_length(server_port_by_option));	
+	
+	server_port = port[3];
+	server_port |= port[2] << 8;
+	server_port |= port[1] << 16;
+	server_port |= port[0] << 24;
+	
+	ret_ip = (server_port & 0x0000ffff) << 16;
+	ret_ip |= (server_port & 0xffff0000) >> 16;
+
+	return ret_ip;
+}
+
+unsigned int u32_little_to_big_endian(unsigned int a)
+{
+	/*unsigned char b[4] = {0} ;
+	
+	b[0] = a>>24;
+	b[1] = a>>16;
+	b[2] = a>>8;
+	b[3] = a;
+	memcpy(&a, b, 4);
+	
+	return a;
+	*/
+	//»òÕßÓÃ
+	 return ((a & 0xff) << 24) |
+    ((a & 0xff00) << 8) |
+    ((a & 0xff0000UL) >> 8) |
+    ((a & 0xff000000UL) >> 24);
+}
+
+unsigned char cd_get_cache_switch_staus(void)
+{
+    unsigned char cache_switch = 0;
+    cd_read_id_card_from_flash(&cache_switch, 1, FLASH_SAVE_ADDR + 200*BLOK_SIZE);
+    if(cache_switch != 1)
+    {
+        cache_switch = 0;
+    }
+    else
+    {
+        cache_switch = 1;
+    }
+    return cache_switch;
+}
+
+unsigned char cd_send_cache_card_info(coap_pdu_t *rx_pdu,unsigned int result_code)
+{                                 
+    unsigned char ret = 0;
+    err_t err;
+    struct ip_addr ipaddr;
+    struct pbuf *pb;	
+    struct udp_pcb *upcb;
+    coap_pdu_t *tx_pdu = cd_pdu_memory_get();
+    if(tx_pdu == NULL)
+        printf("tx_pdu malloc err!\r\n");
+    
+    tx_pdu->max_size  = COAP_MAX_PDU_SIZE;
+    tx_pdu->hdr->type = COAP_MESSAGE_NON; //ÎÞÓ¦´ð
+    tx_pdu->hdr->code = COAP_REQUEST_POST;
+    //tx_pdu->hdr->id = massage_id;  	
+    //coap_add_token(tx_pdu, tx_token_len, tx_token);
+    tx_pdu->hdr->id = cd_coap_get_message_id();  
+    unsigned int token_id = 0;		
+    token_id = cd_coap_get_token_id(1000, 105);
+    coap_add_token(tx_pdu, 4, (unsigned char*)&token_id);
+    
+    from_id_len = cd_udp_get_from_id(from_id, rx_pdu);
+    to_id_len = cd_udp_get_to_id(to_id, rx_pdu);
+    ip_len = cd_udp_get_server_ip(server_ip, rx_pdu);
+    server_port = cd_udp_get_server_port(rx_pdu);
+    
+    coap_add_option(tx_pdu, CD_COAP_OPTION_URI_PATH, 3, "105");
+    coap_add_option(tx_pdu, CD_COAP_OPTION_FROM_ID, from_id_len, from_id);
+    coap_add_option(tx_pdu, CD_COAP_OPTION_TO_ID , to_id_len, to_id);
+    coap_add_option(tx_pdu, CD_COAP_OPTION_TO_FUNC , 1, "\x69");
+    coap_add_option(tx_pdu, CD_COAP_OPTION_LOCAL_IP , ip_len, server_ip);
+    coap_add_option(tx_pdu, CD_COAP_OPTION_LOCAL_PORT , 4, (unsigned char *)&server_port);
+
+    unsigned int tmp_result_code = 0;
+    tmp_result_code = u32_little_to_big_endian(result_code);
+    coap_add_payload(tx_pdu, 1, sizeof(tmp_result_code), (unsigned char*)&tmp_result_code);
+
+    if(result_code != 2)                                  //²»µÈÓÚtoken´íÎó²Å·¢ËÍÉí·ÝÖ¤Êý¾Ý
+    {
+        unsigned int tmp_session_id = 0;
+        tmp_session_id = u32_little_to_big_endian(session_id);
+        coap_add_payload(tx_pdu, 101, sizeof(tmp_session_id), (unsigned char*)&tmp_session_id);
+        
+        unsigned int len = 2+2+256+1024+1;
+        coap_add_payload(tx_pdu, 106, len, save_card_info+36);
+        //printf("id card data: len=%d\r\n", len);
+        //print_hex_dump_bytes(save_card_info+36, len);
+    }
+    else
+    {
+        printf("token err, notify client!\r\n");
+    }
+    
+    for(int i=0; i<3; i++)
+    {
+        upcb = udp_new();                               //ÉêÇëÄÚ´æ
+        if(upcb == NULL)
+        {
+            printf("upcb is null\r\n");
+            if(tx_pdu != NULL)
+                    cd_pdu_memory_remove(tx_pdu);
+            return 0;
+        }
+        
+        cd_sam_config_t tmp_sam_config;
+        cd_get_sam_config(&tmp_sam_config);                     //»ñµÃÅäÖÃ½á¹¹Ìå
+        unsigned short tmp_port = 0;
+        tmp_port = tmp_sam_config.port[1];
+        tmp_port |= tmp_sam_config.port[0] << 8;
+        udp_bind(upcb, IP_ADDR_ANY, 5000);                  //°ó¶¨±¾»úµÄ¶Ë¿ÚºÍIP£¨IPÎªÈÎÒâ?
+    //	printf("remote ip:%d.%d.%d.%d\r\n", client_ip_table[0], client_ip_table[1], client_ip_table[2], client_ip_table[3]);
+        IP4_ADDR(&ipaddr, client_ip_table[0], client_ip_table[1], client_ip_table[2], client_ip_table[3]);
+        err = udp_connect(upcb, &ipaddr, client_port);
+        if(err == ERR_OK)
+        {
+            pb = pbuf_alloc(PBUF_TRANSPORT, tx_pdu->length, PBUF_POOL);	//allocate pbuf from pool
+            if (pb != NULL)
+            {
+                pbuf_take(pb, (char*)tx_pdu->hdr, tx_pdu->length);		//copy data to pbuf 
+               // printf("tx client: len=%d\r\n", tx_pdu->length);
+               // print_hex_dump_bytes(tx_pdu->hdr, tx_pdu->length);
+                
+               // cd_dbg_net_flip(0);
+
+                udp_send(upcb, pb);								//send udp data 
+                pbuf_free(pb);											//free pbuf 
+                cd_set_green_Ethernet(LED_OFF);
+                ret = 1;
+            }
+            else
+            {
+                ret = 0;
+                printf("pbuf_alloc err!, len=%d\r\n", tx_pdu->length);
+            }
+        }
+        
+        udp_disconnect(upcb);                             //free the UDP connection, so we can accept new clients 
+        udp_remove(upcb);
+        
+        printf("send card data times=%d\r\n", i+1);
+    }
+    
+    if(tx_pdu != NULL)
+        cd_pdu_memory_remove(tx_pdu);
+
+    if(result_code != 2)                             //¶Á¿¨³É¹¦²ÅÖ´ÐÐ
+    {
+        result_code = 1;                         //³É¹¦
+        cd_send_id_card_data_to_plat(id_card_buf, id_card_buf_len, result_code, retry_times);
+        cd_send_log_to_plat(result_code);
+        cd_free_all_log();
+    }
+}
+
+unsigned char cd_send_cache_ack(coap_pdu_t *rx_pdu, unsigned char *cache_ip_table, unsigned short cache_port)
+{
+    unsigned char ret = 0;
+    err_t err;
+    struct ip_addr ipaddr;
+    struct pbuf *pb;	
+    struct udp_pcb *upcb;
+    unsigned int token_len = 0;
+    unsigned char token[4] = {0};
+    
+    coap_pdu_t *tx_pdu = cd_pdu_memory_get();
+    
+    if(tx_pdu == NULL)
+        printf("tx_pdu malloc err!\r\n");
+    
+    token_len = cd_get_tx_token(rx_pdu, token);
+    unsigned short tmp_massage_id = cd_udp_get_massage_id(rx_pdu);  
+    tx_pdu->max_size  = COAP_MAX_PDU_SIZE;
+    tx_pdu->hdr->type = COAP_MESSAGE_ACK; 
+    tx_pdu->hdr->code = COAP_RESPONSE_CODE(205);
+    tx_pdu->hdr->id = tmp_massage_id;  	
+    coap_add_token(tx_pdu, token_len, token);
+    
+    coap_add_option(tx_pdu, CD_COAP_OPTION_URI_PATH, 3, "108");
+    coap_add_option(tx_pdu, CD_COAP_OPTION_FROM_ID, from_id_len, from_id);
+    coap_add_option(tx_pdu, CD_COAP_OPTION_TO_ID , to_id_len, to_id);
+    coap_add_option(tx_pdu, CD_COAP_OPTION_TO_FUNC , 1, "\x6C");    //108
+    coap_add_option(tx_pdu, CD_COAP_OPTION_LOCAL_IP , ip_len, server_ip);
+    coap_add_option(tx_pdu, CD_COAP_OPTION_LOCAL_PORT , 4, (unsigned char*)&server_port);
+
+    unsigned int result_code = 0;
+    unsigned int tmp_result_code = 0;
+    result_code = 1;
+    tmp_result_code = u32_little_to_big_endian(result_code);
+    coap_add_payload(tx_pdu, 1, sizeof(tmp_result_code), (unsigned char*)&tmp_result_code);
+
+    upcb = udp_new();                               //ÉêÇëÄÚ´æ
+    if(upcb == NULL)
+    {
+        printf("upcb is null\r\n");
+        if(tx_pdu != NULL)
+            cd_pdu_memory_remove(tx_pdu);
+        return 0;
+    }
+    
+    cd_sam_config_t tmp_sam_config;
+    cd_get_sam_config(&tmp_sam_config);                     //»ñµÃÅäÖÃ½á¹¹Ìå
+    unsigned short tmp_port = 0;
+    tmp_port = tmp_sam_config.port[1];
+    tmp_port |= tmp_sam_config.port[0] << 8;
+    udp_bind(upcb, IP_ADDR_ANY, 5000);                  //°ó¶¨±¾»úµÄ¶Ë¿ÚºÍIP£¨IPÎªÈÎÒâ?
+    IP4_ADDR(&ipaddr, cache_ip_table[0], cache_ip_table[1], cache_ip_table[2], cache_ip_table[3]);
+    err = udp_connect(upcb, &ipaddr, cache_port);
+    if(err == ERR_OK)
+    {
+        pb = pbuf_alloc(PBUF_TRANSPORT, tx_pdu->length, PBUF_POOL);	//allocate pbuf from pool
+        if (pb != NULL)
+        {
+            pbuf_take(pb, (char*)tx_pdu->hdr, tx_pdu->length);		//copy data to pbuf 
+             //printf("tx client: len=%d\r\n", tx_pdu->length);
+             //print_hex_dump_bytes(tx_pdu->hdr, tx_pdu->length);
+                
+            //cd_dbg_net_flip(0);
+            
+            udp_send(upcb, pb);								//send udp data 
+            pbuf_free(pb);											//free pbuf 
+            //cd_set_green_Ethernet(LED_OFF);
+            ret = 1;
+        }
+        else
+        {
+            ret = 0;
+            printf("pbuf_alloc err!, len=%d\r\n", tx_pdu->length);
+        }
+    }
+    
+    udp_disconnect(upcb);                             //free the UDP connection, so we can accept new clients 
+    udp_remove(upcb);
+    if(tx_pdu != NULL)
+        cd_pdu_memory_remove(tx_pdu);
+
+    return ret;
+}
+unsigned char cd_udp_rx_coap_process(struct udp_pcb *upcb, struct ip_addr *addr, unsigned short port, struct pbuf *p)
+{
+	coap_pay_t *payload = NULL;
+	coap_opt_t *uri_option = NULL;
+	coap_opt_t *option_cer_flag = NULL; 
+	coap_opt_t *from_id_option = NULL; 
+	unsigned char tmp[4] ={0};   
+	unsigned int tmp_time = 0; 
+	unsigned char tmp_token[4] = {0};
+	unsigned char from_id[8] = {0};
+	unsigned char tmp_buf[8] = {0};
+	unsigned int from_id_len = 0;
+	cd_log_t log_rx_net;
+	cd_log_t log_tx_sam;
+    
+	//cd_dbg_net_flip(1);
+	
+	tmp_time = OSTimeGet();
+ 
+	//cd_set_green_Ethernet(LED_ON);	
+	
+	coap_pdu_t *rx_pdu = cd_pdu_memory_get();
+	if(rx_pdu == NULL)
+	{
+		printf("rx_pdu is NULL\r\n");
+		cd_pdu_memory_remove(rx_pdu);
+		return 0;
+	}
+	
+	cd_udp_read_pdu_data(rx_pdu, p->payload, p->len);
+	pbuf_free(p);
+	
+   // printf("rx : len=%d\r\n", rx_pdu->length);
+   // print_hex_dump_bytes(rx_pdu->hdr, rx_pdu->length);
+    
+	if(rx_pdu->hdr->code > 0 && rx_pdu->hdr->code <= 30 )//ÇëÇó
+    {
+     	switch(rx_pdu->hdr->type)
+        {
+			case COAP_MESSAGE_NON:
+				uri_option = cd_find_option_type(rx_pdu, CD_COAP_OPTION_TO_FUNC);//uri
+				//printf("uri %d\r\n", *coap_opt_value(uri_option));
+				switch(*coap_opt_value(uri_option))
+				{
+					case 102 :
+                        
+						from_id_option = cd_find_option_type(rx_pdu, CD_COAP_OPTION_FROM_ID);
+						from_id_len = coap_opt_length(from_id_option);
+						memcpy(from_id, coap_opt_value(from_id_option), from_id_len);
+                        memset(tmp_buf, 0, 8);
+						if(memcmp(from_id, save_from_id, from_id_len) != 0 && memcmp(save_from_id, tmp_buf, 8) != 0)
+						{	
+							printf("different from id can not read card at the same time\r\n");
+//                            printf("save_from_id: len=%d\r\n", from_id_len);
+//                            print_hex_dump_bytes(save_from_id, from_id_len);
+//                            printf("from_id: len=%d\r\n", from_id_len);
+//                            print_hex_dump_bytes(from_id, from_id_len);
+//                            printf("tmp_buf: len=%d\r\n", 8);
+//                            print_hex_dump_bytes(tmp_buf, 8);
+                            
+							cd_pdu_memory_remove(rx_pdu);
+							return 0;
+						}
+						memcpy(save_from_id, from_id, from_id_len);
+						
+						//printf("from_id: len=%d\r\n", from_id_len);
+						//print_hex_dump_bytes(from_id, from_id_len);
+						
+                        client_upcb = upcb;                         
+                        client_addr = addr;
+                        client_port = port;
+                        //printf("client_port=%d\r\n", client_port);
+                        client_ip = *(unsigned int*)client_addr; 
+                        client_ip_table[3] = (uint8_t)(client_ip >> 24);
+                        client_ip_table[2] = (uint8_t)(client_ip >> 16);
+                        client_ip_table[1] = (uint8_t)(client_ip >> 8);
+                        client_ip_table[0] = (uint8_t)(client_ip);	
+                            
+						payload = cd_find_payload_type(rx_pdu, 101);  //»á»°±àºÅ
+						if(payload == NULL)
+						{
+							printf("uri 102 payload 101 is NULL.\r\n");
+							break;
+						}
+						
+						memcpy(tmp + (4 - coap_pay_length(payload)) , coap_pay_value(payload), coap_pay_length(payload));
+						session_id = tmp[3];
+						session_id |= tmp[2] << 8;
+						session_id |= tmp[1] << 16;
+						session_id |= tmp[0] << 24;
+						memset(tmp, 0, 4);
+						
+						//printf("session_id : %d\r\n", session_id);
+						
+						payload = cd_find_payload_type(rx_pdu, 104);  //Éí·ÝÖ¤Í·Êý¾Ý
+						if(payload == NULL)
+						{
+							printf("uri 102 payload 104 is NULL.\r\n");
+							break;
+						}
+						memcpy(id_card_head_buf, coap_pay_value(payload), coap_pay_length(payload));
+                        head_len = coap_pay_length(payload) + 1;
+                        id_card_head_buf[head_len - 1] = 0x00;           //²¹0£¬ Ó¦ÎªÏÖÔÚÊÖ»ú·¢¹ýÀ´µÄÊý¾Ý¶¼ÊÇÉÙ0µÄ
+                        
+                        // printf("head_buf : len=%d\r\n", head_len);
+                       // print_hex_dump_bytes(id_card_head_buf, head_len);
+						#if 1
+						payload = cd_find_payload_type(rx_pdu, 105);  //ÊÚÈ¨ÁîÅÆ
+						if(payload == NULL)
+						{
+							printf("uri 102 payload 105 is NULL.\r\n");
+							break;
+						}
+						
+						memcpy(client_au_token, coap_pay_value(payload), coap_pay_length(payload));
+						au_token_len = coap_pay_length(payload);
+						
+						unsigned char fixed_token[] = "CD2004052500";                       //Ö±Á¬Ä¬ÈÏtoken
+						if(memcmp(fixed_token, client_au_token, coap_pay_length(payload)) != 0)
+						{
+							if(memcmp(plat_au_token, client_au_token, coap_pay_length(payload)) != 0) //·ÇÖ±Á¬µÄÄ£Ê½,ÐèÒªÐ£ÑépaltµÄclientµÄtoken
+							{	
+								printf("client_au_token is err!\r\n");
+								read_id_card_result_code = 2;                   //token´íÎó,Í¨Öªclient
+								cd_rx_id_card_data_msg(read_id_card_result_code);
+								break;	
+							}
+							else
+							{
+								printf("client_au_token is ok!\r\n");
+							}
+						}	
+						#endif						
+						payload = cd_find_payload_type(rx_pdu, 113);  //¶ÁÈ¡Éí·ÝÖ¤Àà±ð
+						if(payload == NULL)
+						{
+							printf("uri 102 payload 113 is NULL.\r\n");
+							break;
+						}
+						memcpy(tmp + (4 - coap_pay_length(payload)) , coap_pay_value(payload), coap_pay_length(payload));
+						read_type = tmp[3];
+						read_type |= tmp[2] << 8;
+						read_type |= tmp[1] << 16;
+						read_type |= tmp[0] << 24;
+						memset(tmp, 0, 4);
+						
+						from_id_len = cd_udp_get_from_id(from_id, rx_pdu);
+						to_id_len = cd_udp_get_to_id(to_id, rx_pdu);
+						ip_len = cd_udp_get_server_ip(server_ip, rx_pdu);
+						server_port = cd_udp_get_server_port(rx_pdu);
+						//tx_token_len = cd_get_tx_token(rx_pdu, tx_token);
+						//massage_id = cd_udp_get_massage_id(rx_pdu); 
+						
+						if(session_id != old_session_id)                        //Í¬Ò»¸ösession_id²ÅÄÜ¶ÁÈ¡
+						{
+                            save_session_id = session_id;
+                            old_session_id = session_id;                            //¸üÐÂold_session_id
+                            //printf("start read card!\r\n");
+                            cd_set_green_Ethernet(LED_ON);	
+                            
+                            if(cd_get_cache_switch_staus() == 1)
+                            {
+                                unsigned char index = 0;
+                                index = cd_query_flash_card_info(id_card_head_buf, head_len);
+                                if(index != 0xFF)
+                                {
+                                    cd_read_id_card_from_flash(save_card_info, (1 + 35 + 2 + 2 + 256 + 1024 + 1), (FLASH_SAVE_ADDR + index * BLOK_SIZE)); 
+                                    OSTimeDlyHMSM(0, 0, 1, 300);	
+                                    read_id_card_result_code = 1;
+                                    cd_send_cache_card_info(rx_pdu, read_id_card_result_code);   
+                                    break;
+                                }        
+                            }
+                            
+                            err_flag = 1;
+                            is_new_card_flag = 0;
+                            memset(have_done_flag_table, 0, sizeof(have_done_flag_table));
+                            for(int i=0; i<CD_PACKET_NUM; i++)
+                            {
+                                cmd_step_process[i] = 0;            //·¢ËÍÍê³É
+                                memset(rx_cmd_table[i], 0,  rx_cmd_table[i][0] + 1);   //Çå¿ÕÊý¾Ý
+                            }
+                            
+							run_status_busy_flag = 1;                           
+							read_id_card_flag = 1;                              //¿ªÊ¼¶Á¿¨
+							read_card_start_time = OSTimeGet();                 //¶Á¿¨¿ªÊ¼Ê±¼ä
+							if(Flag.cer_flag_ok == 1)
+							{
+								Run_status = RUN_STATUS_BUSY;                       //ÕýÔÚ½âÂë
+								printf("report status : busy\r\n");
+								cd_sam_report_status();                             //Í¬Ò»¸ösession_id Ö»·¢ËÍÒ»´ÎÉÏ±¨
+							}
+						}
+						
+						if(read_id_card_flag == 1)                              //¿ªÊ¼¶Á¿¨
+						{
+                            printf("start read card!\r\n");
+							cd_sam_rx_init();						
+							retry_id = 3;
+
+                            if(err_flag == 1)                                   //Ö»ÓÐ·¢ËÍÁË¸´Î»ÏûÏ¢ºó£¬ ²ÅÖØÐÂ·¢ËÍÃüÁî, ·ñÔòÈÏÎªÊÇÍ¬Ò»¸ösessionµÄ¶Á¿¨
+                            {    
+                                err_flag = 0;
+                                send_step_id = 8;                               //¶¨Ê±Æ÷¿ªÊ¼·¢ËÍµÄ¿ªÊ¼·¢ËÍ
+                                err_timeout_count = 0;
+                                usart_err_send_retry_flag = 0;
+                                timeout_flag = 0;
+                                send_data_to_sam_flag = END;
+                                counter = 0;
+                                rx_tmp_id = 0;                               
+                                
+                                cd_sam_v_query_id_card();                         //·¢ËÍÑ°¿¨ÃüÁîµ½½âÂëÆ÷
+							
+                                log_rx_net.step_id = 4;
+                                log_rx_net.type = READ_NET;
+                                log_rx_net.time = tmp_time;
+                                log_rx_net.len = head_len;
+                                memcpy(log_rx_net.data, id_card_head_buf, head_len);
+                                cd_log_set(log_rx_net);
+                                cd_free_log(log_rx_net);
+                            }
+						}
+						break;
+						
+					case 104 : 
+                        unsigned int tmp_time = 0;
+                        	
+                        tmp_time = OSTimeGet();
+                        cd_set_green_Ethernet(LED_ON);
+                    
+						payload = cd_find_payload_type(rx_pdu, 101);      //1.»á»°±àºÅ
+						if(payload == NULL)
+						{
+							printf("uri 104 payload 101 is NULL.\r\n");
+							break;
+						}
+						memcpy(tmp + (4 - coap_pay_length(payload)) , coap_pay_value(payload), coap_pay_length(payload));
+						session_id = tmp[3];
+						session_id |= tmp[2] << 8;
+						session_id |= tmp[1] << 16;
+						session_id |= tmp[0] << 24;
+						memset(tmp, 0, 4);
+						//printf("session_id : %d\r\n", session_id);
+						//print_hex_dump_bytes(&session_id, 4);
+						
+						payload = cd_find_payload_type(rx_pdu, 102);     //2.²½Öè±àºÅ
+						if(payload == NULL)
+						{
+							printf("uri 104 payload 102 is NULL.\r\n");
+							break;
+						}
+						memcpy(tmp + (4 - coap_pay_length(payload)), coap_pay_value(payload), coap_pay_length(payload));
+						step_id = tmp[3];
+						step_id |= tmp[2] << 8;
+						step_id |= tmp[1] << 16;
+						step_id |= tmp[0] << 24;
+						memset(tmp, 0, 4);
+					    
+						payload = cd_find_payload_type(rx_pdu, 103);  //3.ÖØ·¢´ÎÊý
+						if(payload == NULL)
+						{
+							printf("uri 104 payload 103 is NULL.\r\n");
+							break;
+						}
+						memcpy(tmp + (4 - coap_pay_length(payload)) , coap_pay_value(payload), coap_pay_length(payload));
+						retry_id = tmp[3];
+						retry_id |= tmp[2] << 8;
+						retry_id |= tmp[1] << 16;
+						retry_id |= tmp[0] << 24;
+						memset(tmp, 0, 4);
+						//printf("retry_id : %d\r\n", retry_id);
+						//print_hex_dump_bytes(&retry_id, 4);
+						
+						payload = cd_find_payload_type(rx_pdu, 104); //4.Í¸´«ÄÚÈÝ
+						if(payload == NULL)
+						{
+							printf("uri 104 payload 104 is NULL.\r\n");
+							break;
+						}
+						 
+                        if(step_id == 5 || step_id == 6 || step_id == 7)
+                        {
+                            unsigned char buf[CD_SAM_SIZE] = {0};
+                            unsigned int len = 0;
+                            
+                            len = coap_pay_length(payload) + 1;
+                            memcpy(buf, coap_pay_value(payload), len - 1);
+                            buf[len - 1] = 0x00;                          //Ôö¼Ó×îºóÒ»¸ö×Ö½Ú
+                            cd_tx_data_to_sam(buf, len);          //·¢ËÍÊÖ»ú¶ËµÄÊý¾Ýµ½½âÂëÆ÷
+                        #ifdef PRINT_STEP
+                            printf("rx step%d, len=%d.\r\n", step_id, len);
+                        #endif
+                            //print_hex_dump_bytes(buf, len);
+                            
+                            log_tx_sam.step_id = step_id;
+                            log_tx_sam.type = SENDTO_SAM;
+                            log_tx_sam.time = OSTimeGet();
+                            log_tx_sam.len = len;                
+                            memcpy(log_tx_sam.data, buf, log_tx_sam.len);
+                            cd_log_set(log_tx_sam);
+                            cd_free_log(log_tx_sam);
+                            memset(buf, 0, sizeof(buf));
+                           
+                        }
+                        else if(have_done_flag_table[step_id - 1] != 1)    //Èç¹ûÒÑ¾­´æµ½±íÀï£¬¾Í¶ªµô
+                        { 
+                            unsigned int len = 0;
+                            unsigned char buf_1[CD_SAM_SIZE] = {0};
+                            unsigned char buf_2[CD_SAM_SIZE] = {0}; 
+                            
+                            len = coap_pay_length(payload) + 1;           
+                            memcpy(buf_1, coap_pay_value(payload), len - 1);
+                            buf_1[len - 1] = 0x00;
+                            
+                            //print_hex_dump_bytes(buf_1, len);
+                            
+                            if(len != 2)
+                            {
+                           #ifdef CD_BLOK_SIZE_50
+                                if(step_id < 33)
+                           #else 
+                                if(step_id < 27)   
+                           #endif                                  
+                                {   
+                                #ifdef PRINT_STEP
+                                    printf("rx step%d, len=%d.\r\n", step_id, len);
+                                #endif    
+                                    have_done_flag_table[step_id - 1] = 1;
+                                    cmd_step_process[step_id - 1] = step_id;   // ¿ÉÒÔ¶ÁÈ¡Êý¾Ý±ê¼Ç
+                                    rx_cmd_table[step_id - 1][0] = len;    //±£´æ³¤¶È
+                                    memcpy(rx_cmd_table[step_id - 1] + 1, buf_1,  rx_cmd_table[step_id - 1][0]);//±£´æÄÚÈÝ
+                                    
+                                }
+                                else 
+                                { 
+                            #ifdef CD_BLOK_SIZE_50
+                                    if(step_id == 33)
+                            #else     
+                                    if(step_id == 27)   
+                            #endif                    
+                                    {
+                                        memset(buf_2, 0, sizeof(buf_2));
+                                        if(memcmp(buf_2, buf_1, len - 3) != 0)  
+                                        {
+                                        #ifdef PRINT_STEP
+                                            printf("rx step%d, len=%d.\r\n", step_id, len);
+                                        #endif 
+                                            is_new_card_flag = 1;               //ÊÇÐÂÉí·ÝÖ¤
+                                            have_done_flag_table[step_id - 1] = 1;
+                                            cmd_step_process[step_id - 1] = step_id;   // ¿ÉÒÔ¶ÁÈ¡Êý¾Ý±ê¼Ç
+                                            rx_cmd_table[step_id - 1][0] = len;       //±£´æ³¤¶È
+                                            memcpy(rx_cmd_table[step_id - 1] + 1, buf_1,  rx_cmd_table[step_id - 1][0]);//±£´æÄÚÈÝ 
+                                           // printf("rx : len=%d\r\n", rx_cmd_table[step_id - 1][0] + 1);
+                                           // print_hex_dump_bytes(rx_cmd_table[step_id - 1], rx_cmd_table[step_id - 1][0] + 1);
+                                        }
+                                        else //²»ÊÇÐÂÉí·ÝÖ¤£¬Çå¿Õ32²½µÄÊý¾Ý
+                                        {
+                                    #ifdef CD_BLOK_SIZE_50           
+                                           have_done_flag_table[31] = 0;
+                                           cmd_step_process[31] = 0;
+                                           memset(rx_cmd_table[31], 0, rx_cmd_table[31][0] + 1); 
+                                    #else
+                                           have_done_flag_table[25] = 0;
+                                           cmd_step_process[25] = 0;
+                                           memset(rx_cmd_table[25], 0, rx_cmd_table[25][0] + 1);  
+                                    #endif
+                                                        
+                                        }
+                                    }
+                                    else if(is_new_card_flag == 1) //ÊÇÉí·ÝÖ¤£¬ °ÑºóÃæµÄÊý¾Ý´æÏÂÀ´ 
+                                    {
+                                    #ifdef PRINT_STEP
+                                        printf("rx step%d, len=%d.\r\n", step_id, len);
+                                    #endif   
+                                        have_done_flag_table[step_id - 1] = 1;
+                                        cmd_step_process[step_id - 1] = step_id;   // ¿ÉÒÔ¶ÁÈ¡Êý¾Ý±ê¼Ç
+                                        rx_cmd_table[step_id - 1][0] = len;    //±£´æ³¤¶È
+                                        memcpy(rx_cmd_table[step_id - 1] + 1, buf_1,  rx_cmd_table[step_id - 1][0]);//±£´æÄÚÈÝ 
+                                        //printf("rx : len=%d\r\n", rx_cmd_table[step_id - 1][0] + 1);
+                                        //print_hex_dump_bytes(rx_cmd_table[step_id - 1], rx_cmd_table[step_id - 1][0] + 1);
+                                    }
+                                    memset(buf_1, 0, sizeof(buf_1));
+                                }
+                            }
+                        }
+                        
+                        log_rx_net.step_id = step_id;
+                        log_rx_net.type = READ_NET;
+                        log_rx_net.time = tmp_time;
+                        if(step_id < 8)                                      //Ö»ÒªÇ°8²½µÄÊý¾Ý
+                        {
+                            unsigned int len = 0;
+                            
+                            len = coap_pay_length(payload) + 1;
+                            log_rx_net.len = len;
+                            memcpy(log_rx_net.data, coap_pay_value(payload), len - 1);
+                            log_rx_net.data[len - 1] = 0x00;
+                        }
+                        else
+                        {
+                             log_rx_net.len = 0;
+                             memset(log_rx_net.data, 0, LOG_DATA_SIZE);
+                        }
+                        cd_log_set(log_rx_net);
+                        cd_free_log(log_rx_net);
+                        
+						from_id_len = cd_udp_get_from_id(from_id, rx_pdu);
+						to_id_len = cd_udp_get_to_id(to_id, rx_pdu);
+						ip_len = cd_udp_get_server_ip(server_ip, rx_pdu);
+						server_port = cd_udp_get_server_port(rx_pdu);
+						//tx_token_len = cd_get_tx_token(rx_pdu, tx_token);
+						//massage_id = cd_udp_get_massage_id(rx_pdu);  
+					
+						break;
+					case 107 : 
+						payload = cd_find_payload_type(rx_pdu, 101);      //1.????
+						if(payload == NULL)
+						{
+							printf("uri 107 payload 101 is NULL.\r\n");
+							break;
+						}
+						unsigned int tmp_session_id = 0;
+						memcpy(tmp + (4 - coap_pay_length(payload)) , coap_pay_value(payload), coap_pay_length(payload));
+						
+						tmp_session_id = tmp[3];
+						tmp_session_id |= tmp[2] << 8;
+						tmp_session_id |= tmp[1] << 16;
+						tmp_session_id |= tmp[0] << 24;
+						memset(tmp, 0, 4);	
+						memset(save_from_id, 0, 8); 
+						//print_hex_dump_bytes(&tmp_session_id, 4);
+						if(tmp_session_id == save_session_id) 
+						{
+							printf("client timeout!\r\n");
+							timeout_flag = 1;
+                            err_flag = 0;
+							read_id_card_flag = 0;                   //¶ÁÈ¡Í£Ö¹
+							tmp_count2 = 0; 
+							cd_timeout_msg.id = MSG_TIMEOUT;
+							cd_send_msg(&cd_timeout_msg);
+						}
+                        else
+                        {
+                            printf("timeout: session_id : %d\r\n", tmp_session_id);
+                            printf("save_session_id : %d\r\n", save_session_id);
+                        }
+						
+						break;	
+					default :
+						break;
+				}
+				
+				break;
+				
+			case COAP_MESSAGE_ACK:
+				break;
+			case COAP_MESSAGE_RST:
+				break;
+			case COAP_MESSAGE_CON:
+				uri_option = cd_find_option_type(rx_pdu, CD_COAP_OPTION_TO_FUNC);//uri
+				//printf("uri %d\r\n", *coap_opt_value(uri_option));
+				switch(*coap_opt_value(uri_option))
+				{
+					case 2:
+						cd_send_ack_to_plat(rx_pdu);
+						printf("step2 auth rx is ok!\r\n");
+						break;
+						
+					case 3:
+						cd_send_ack_to_plat(rx_pdu);
+						printf("step3 auth rx is ok!\r\n");
+						break;
+						
+					case 4:	
+						cd_send_ack_to_plat(rx_pdu);						
+						Flag.cer_flag_ok = 1;                                //ÈÏÖ¤³É¹¦±êÖ¾		
+						printf("step4 auth rx ok!\r\n");
+						
+						break;
+						
+					case 80:                                                 //ÏÂ·¢ÁîÅÆ                           
+						 //option_cer_flag
+						option_cer_flag = cd_find_option_type(rx_pdu, CD_COAP_OPTION_CER_FLAG);
+					//	printf("uri 80 option_cer_flag=%d\r\n", *coap_opt_value(option_cer_flag));
+						if(*coap_opt_value(option_cer_flag) == 2)     //ÐèÒªÖØÐÂÈÏÖ¤
+						{
+							printf("restart au!\r\n");
+							cd_sam_request_au();
+							break;
+						}
+						
+						payload = cd_find_payload_type(rx_pdu, 105);         //ÁîÅÆ
+						if(payload == NULL)
+						{
+							printf("uri 80 payload 105 is NULL.\r\n");
+							break;
+						}
+						memcpy(plat_au_token, coap_pay_value(payload), coap_pay_length(payload));
+						
+						payload = cd_find_payload_type(rx_pdu, 111);        //¶Á¿¨Æ÷hid
+						if(payload == NULL)
+						{
+							printf("uri 80 payload 111 is NULL.\r\n");
+							break;
+						}
+						
+						cd_send_ack_to_plat(rx_pdu);
+						printf("token is received!\r\n");
+						break;
+					case 108:
+                        payload = cd_find_payload_type(rx_pdu, 108);         //ÁîÅÆ
+						if(payload == NULL)
+						{
+							printf("uri 108 payload 108 is NULL.\r\n");
+							break;
+						}
+                        
+                        cache_switch_flag = *coap_pay_value(payload);
+                        cd_write_id_card_data_to_flash(&cache_switch_flag, 1, FLASH_SAVE_ADDR + 200*BLOK_SIZE); 
+                        printf("cache_switch_flag = %d\r\n", cache_switch_flag);
+                        
+                        unsigned short cache_port;
+                        unsigned int cache_ip = 0;
+                        unsigned char cache_ip_table[4] = {0};
+                        struct ip_addr *cache_addr = NULL;
+                       
+                        cache_addr = addr;
+                        cache_port = port;
+                        cache_ip = *(unsigned int*)cache_addr; 
+                        cache_ip_table[3] = (uint8_t)(cache_ip >> 24);
+                        cache_ip_table[2] = (uint8_t)(cache_ip >> 16);
+                        cache_ip_table[1] = (uint8_t)(cache_ip >> 8);
+                        cache_ip_table[0] = (uint8_t)(cache_ip);
+                        cd_send_cache_ack(rx_pdu, cache_ip_table, cache_port);
+                        break;
+                        
+					default:
+						break;
+				}
+				
+				break;
+		}
+	}
+    else if(rx_pdu->hdr->code >30 )			//Ó¦´ð
+	{
+		//printf("rx : len=%d\r\n", rx_pdu->length);
+		//print_hex_dump_bytes(rx_pdu->hdr, rx_pdu->length);
+		uri_option = cd_find_option_type(rx_pdu, CD_COAP_OPTION_TO_FUNC);//uri
+		//printf("uri %d\r\n", *coap_opt_value(uri_option));
+		switch(*coap_opt_value(uri_option))
+		{
+			case 1:
+				payload = cd_find_payload_type(rx_pdu, 1);  		//´¦Àí½á¹û
+				if(payload == NULL)
+				{
+					printf("uri 1 payload 1 is NULL.\r\n");
+					break;
+				}
+				
+				if(*coap_pay_value(payload) == 2)
+				{
+					cd_sam_register();
+					printf("sam register is ok!\r\n");
+				}
+				if(*coap_pay_value(payload) == 1)
+				{
+					payload = cd_find_payload_type(rx_pdu, 21);  //Ö÷¿ØÆ÷³õÊ¼ÃØÔ¿¼ÓÃÜÓ¦´ð
+					if(payload == NULL)
+					{
+						printf("uri 1 payload 21 is NULL.\r\n");
+						break;
+					}
+				
+					if(desDecBuf(0,coap_pay_length(payload), Init_key, coap_pay_value(payload)) == 0)
+					{
+						printf("step1 auth Rx dec err!\r\n");
+						break;
+					}	
+							
+					if(cd_is_data_equal(coap_pay_value(payload), random, 8))	
+					{
+						printf("step1 des data is ok!\r\n");	
+					}	
+					else
+					{
+						printf("step1 des data is err!\r\n");
+						break;
+					}
+				}
+				printf("step1 auth rx is ok!\r\n");
+				
+				break;
+			
+			case 10:
+				payload = cd_find_payload_type(rx_pdu, 1);  		//Éè±¸×¢²áÓ¦´ð
+				if(payload == NULL)
+				{
+					printf("uri 10 payload 1 is NULL.\r\n");
+					break;
+				}
+				
+				unsigned int tmp_result_code = 0; 
+				tmp_result_code = *coap_pay_value(payload);
+				printf("tmp_result_code=%d\r\n", tmp_result_code);
+				if(tmp_result_code == 1)
+				{
+					Flag.register_flag_ok = 1;
+					printf("rx register ack is ok!\r\n");             		//×¢²á³É¹¦
+				}
+				else if(tmp_result_code == 2)
+				{
+					printf("the dev has existed!\r\n");     		//Éè±¸ÒÑ¾­´æÔÚ
+				}
+				else if(tmp_result_code == 3)
+				{
+					printf("template not exist!\r\n");      		//ÀàÄ£°å²»´æÔÚ
+				}
+				break;
+				
+			case 12:                                                          // Éè±¸ÐÄÌø
+                //option_cer_flag
+			    option_cer_flag = cd_find_option_type(rx_pdu, CD_COAP_OPTION_CER_FLAG);
+				//printf("uri 12 option_cer_flag=%d\r\n", *coap_opt_value(option_cer_flag));
+			    if(*coap_opt_value(option_cer_flag) == 2)     //ÐèÒªÖØÐÂÈÏÖ¤
+				{
+					printf("restart au!\r\n");
+					cd_sam_request_au();
+					break;
+				}
+				
+				payload = cd_find_payload_type(rx_pdu, 3);  
+				if(payload == NULL)
+				{
+					printf("uri 12 payload 3 is NULL.\r\n");
+					break;
+				} 
+				
+				unsigned int tmp = 0;
+				tmp = *coap_pay_value(payload);
+				if(tmp == Heart_serial + 1)   
+                {					
+					Heart_serial = tmp;                     		//¸üÐÂÐÄÌøÐòÁÐºÅ
+					printf("rx Heart_serial ack is ok!\r\n");
+				}
+				else
+				{
+					printf("rx Heart_serial ack err!\r\n");
+				}
+				
+//				payload = cd_find_payload_type(rx_pdu, 4);  		//×îÐÂ³ÌÐò°æ±¾ºÅ
+//				if(payload == NULL)
+//				{
+//					printf("uri 12 payload 4 is NULL.\r\n");
+//					break;
+//				}
+//				
+//				printf("program version:\r\n");
+//				print_hex_dump_bytes(coap_pay_value(payload), coap_pay_length(payload));
+//				
+//				payload = cd_find_payload_type(rx_pdu, 5);  
+//				if(payload == NULL)
+//				{
+//					printf("uri 12 payload 5 is NULL.\r\n");
+//					break;
+//				}
+//				
+//				printf("config version:\r\n");
+//				print_hex_dump_bytes(coap_pay_value(payload), coap_pay_length(payload));
+//				
+//				payload = cd_find_payload_type(rx_pdu, 6);  
+//				if(payload == NULL)
+//				{
+//					printf("uri 12 payload 6 is NULL.\r\n");
+//					break;
+//				}
+//                
+//				printf("palt time:\r\n");
+//				print_hex_dump_bytes(coap_pay_value(payload), coap_pay_length(payload));
+//				
+				break;
+				
+			case 13:                                                              	//¶Á¿¨½á¹û 
+				//option_cer_flag
+			    option_cer_flag = cd_find_option_type(rx_pdu, CD_COAP_OPTION_CER_FLAG);
+				//printf("uri 13 option_cer_flag=%d\r\n", *coap_opt_value(option_cer_flag));
+			    if(*coap_opt_value(option_cer_flag) == 2)     //ÐèÒªÖØÐÂÈÏÖ¤
+				{
+					printf("restart au!\r\n");
+					cd_sam_request_au();
+					break;
+				}
+				
+				payload = cd_find_payload_type(rx_pdu, 1);  		
+				if(payload == NULL)
+				{
+					printf("uri 13 payload 1 is NULL.\r\n");
+					break;
+				}	
+				unsigned int tmp_result_13 = 0;
+				tmp_result_13 = *coap_pay_value(payload);
+				if(tmp_result_13 == 1)
+					printf("rx id card info ack is ok!\r\n");
+				break;
+				
+			case 14:                                                           //Éè±¸×´Ì¬
+				//option_cer_flag
+			    option_cer_flag = cd_find_option_type(rx_pdu, CD_COAP_OPTION_CER_FLAG);
+//				printf("uri 14 option_cer_flag=%d\r\n", *coap_opt_value(option_cer_flag));
+			    if(*coap_opt_value(option_cer_flag) == 2)     //ÐèÒªÖØÐÂÈÏÖ¤
+				{
+					printf("restart au!\r\n");
+					cd_sam_request_au();
+					break;
+				}	
+				
+				payload = cd_find_payload_type(rx_pdu, 1);  		
+				if(payload == NULL)
+				{
+					printf("uri 14 payload 1 is NULL.\r\n");
+					break;
+				}
+				unsigned int tmp_result_14 = 0;
+				tmp_result_14 = *coap_pay_value(payload);
+				if(tmp_result_14 == 1)
+					printf("rx run status ack is ok!\r\n");
+				break;
+				
+			case 21:                                                      //¶Á¿¨½á¹û
+				//option_cer_flag
+			    option_cer_flag = cd_find_option_type(rx_pdu, CD_COAP_OPTION_CER_FLAG);
+//				printf("uri 21 option_cer_flag=%d\r\n", *coap_opt_value(option_cer_flag));
+			    if(*coap_opt_value(option_cer_flag) == 2)     //ÐèÒªÖØÐÂÈÏÖ¤
+				{
+					printf("restart au!\r\n");
+					cd_sam_request_au();
+					break;
+				}	
+				
+				payload = cd_find_payload_type(rx_pdu, 1);  		
+				if(payload == NULL)
+				{
+					printf("uri 21 payload 1 is NULL.\r\n");
+					break;
+				}	
+				unsigned int tmp_result_21 = 0;
+				tmp_result_21 = *coap_pay_value(payload);
+				if(tmp_result_21 == 1)
+					printf("rx log ack is ok!\r\n");
+				break;
+				
+			default:
+				break;
+		}
+	}
+	cd_pdu_memory_remove(rx_pdu);
+	
+	return 1;
+}
+
+unsigned char cd_sam_and_plat_swap_data_process(void)
+{	
+    static unsigned int err_retry = 0;
+	static unsigned char set_sam_idle_flag = 0;
+	Flag.cer_start_flag = 1;
+	set_sam_idle_flag = 1;
+	while(1)
+	{	
+		if(Flag.cer_start_flag == 1 && Flag.cer_flag_ok == 0)
+		{
+			Flag.cer_start_flag = 0;
+			cd_sam_request_au();
+		}
+		
+		//Èç¹ûplat¹Ø±ÕÖØÆô£¬ ÒªÖØÐÂÈÏÖ¤
+		if(Flag.cer_flag_ok == 1)                  
+		{	
+			if(set_sam_idle_flag == 1)     //Ö»Ö´ÐÐÒ»´Î¾Í¿ÉÒÔ
+			{
+				set_sam_idle_flag = 0;
+				Run_status = RUN_STATUS_IDLE;                       
+				cd_sam_report_status(); 
+			}
+			
+			if(Flag.send_heartbean_flag == 1)
+			{
+				Flag.send_heartbean_flag = 0;
+				printf("report heartbeat!\r\n");
+				cd_sam_report_heartbean();
+			}
+		}
+        
+        if(usart_err_send_retry_flag == 1)
+        {
+            err_timeout_count++;
+            if(err_timeout_count == 100)
+            {
+                err_retry++;
+                if(err_retry == 10)
+                {
+                    err_retry = 0;
+                    err_timeout_count = 0;
+                    usart_err_send_retry_flag = 0;
+                }
+                else
+                {
+                    err_timeout_count = 0;
+                    usart_err_send_retry_flag = 0;
+                    cd_usart_rx_cmd_err();
+                }
+            }
+        }
+		OSTimeDlyHMSM(0, 0, 0, 10);
+	}
+}
+
+
+
+

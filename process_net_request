@@ -15,7 +15,7 @@
 #include "etharp.h"
 #include <cd_config.h>
 
-#define  BLOK_SIZE              2048
+#define  BLOK_SIZE              1024
 unsigned char save_card_info[BLOK_SIZE] = {0};
 #define CARD_INFO_COUNT         200                         //²»ÄÜ´óÓÚ254
 #define CARD_INFO_LENTH sizeof(save_card_info)	 		  	//Êý×é³¤¶È	

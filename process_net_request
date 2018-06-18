@@ -19,6 +19,7 @@
 // test
 //master
 //test3
+//master1
 #define  BLOK_SIZE              1024
 unsigned char save_card_info[BLOK_SIZE] = {0};
 #define CARD_INFO_COUNT         200                         //²»ÄÜ´óÓÚ254
